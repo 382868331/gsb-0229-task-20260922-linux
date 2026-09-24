@@ -5,6 +5,10 @@
 Dulmage–Mendelsohn 可达性划分欠定 / 良定 / 过定三区，并对良定匹配图做
 强连通分量（SCC）块三角排序，输出行列置换、块边界与可独立核验的匹配证书。
 
+除一次性的**静态入口** `analyze()` 外，还提供**有状态模型**
+`StructuralModel`：对非零模式做批量增、删，随后全量重算最大匹配与三区，
+更新过程原子提交（失败不留半更新状态），结果与静态入口逐字段一致。
+
 - **Python 版本**：Python 3.14.7（仅使用标准库，`dataclasses` / `collections` / `math`）
 - **依赖**：无第三方依赖，安装 Python 后即可运行；核心、测试、演示全部离线
 - **输入上限**：矩阵维度与下标为接口硬边界：行数、列数均 ≤ **100**，
@@ -16,10 +20,11 @@ Dulmage–Mendelsohn 可达性划分欠定 / 良定 / 过定三区，并对良�
 ## 运行命令
 
 ```bash
-# 必要测试（独立枚举参考 + 结构检查），约 0.03 秒
+# 必要测试（独立枚举参考 + 结构检查，含动态批量更新），约 0.1 秒
 python -m unittest discover -s tests -v
 
-# 固定输入演示：正常结果（含不可约块）+ 两个实际触发的异常边界，约 0.1 秒内
+# 固定输入演示：静态正常结果（含不可约块）+ 动态批量增删 + 三个实际触发的
+# 异常边界，约 0.1 秒内
 python demo.py
 ```
 
@@ -29,6 +34,7 @@ python demo.py
 
 ```python
 from sparsestruct import analyze, verify, StructuralDecomposition, Block
+from sparsestruct import StructuralModel, UpdateReport  # 有状态批量更新
 from sparsestruct import (
     StructuralError,            # 本库错误基类（ValueError 子类）
     InvalidStructureError,      # 非法结构
@@ -81,16 +87,62 @@ d = analyze(entries, n_rows=None, n_cols=None, *, budget=None)
 
 失败抛 `StructuralError`，成功返回 `True`。
 
+### `StructuralModel`：有状态的批量增删 + 全量重算
+
+```python
+model = StructuralModel(entries=(), n_rows=None, n_cols=None,
+                        *, auto_dim=True, budget=None)
+report = model.update(add=(), remove=(), *, budget=省略则沿用模型预算)
+report = model.add_edges(entries)      # 只增的便捷入口
+report = model.remove_edges(entries)   # 只删的便捷入口
+d = model.recompute()                  # 空批次全量重算，返回新证书
+```
+
+- **构造**：参数与 `analyze()` 相同（同样的下标/维度/budget 校验），另加
+  `auto_dim`：
+  - `True`（默认）：`n_rows` / `n_cols` 是初始**下界**，之后加边可自动
+    扩大维度；删边**不收缩**维度（空行 / 空列作为显式维度保留）；
+  - `False`：维度构造时固定，加边越界报 `InvalidStructureError`。
+- **`update(add, remove)`**：一次批次内完成批量新增与删除，然后做一次
+  **全量重算**。批次内：
+  - 位置自动去重；添加已存在的边记为 `added_duplicates`，删除不存在的边
+    记为 `removed_missing`，二者都**不是错误**；
+  - 同一位置在同一批次里既增又删属于歧义，报 `InvalidStructureError`；
+  - 坐标校验规则与静态入口一致（拒绝 bool / float / NaN / 负数 / 超限），
+    错误信息带批次内定位，如 `remove[1] 的行号: ...`。
+- **原子性**：先在副本上完成“校验全部输入 → 改边集 → 全量重算”，成功后
+  才一次性替换旧状态。任一步失败（非法输入、固定维度越界、
+  `SearchBudgetExhausted`）都**不留下半更新状态**：`edges()`、维度与
+  `decomposition` 仍是上一次成功的结果。传入的生成器若中途抛错，已产出
+  的边也不会入库。
+- **结果一致性**：全量重算与 `analyze()` 走同一实现，因此恒有
+  `model.decomposition == analyze(model.edges(), model.n_rows, model.n_cols)`
+  （测试逐字段断言）。
+- 只读视图：`model.n_rows` / `n_cols` / `decomposition` / `budget`、
+  `model.edges()`（`frozenset` 快照）、`len(model)`、`(r,c) in model`；
+  `model.set_budget(b)` 改后续重算预算。
+
+返回不可变的 `UpdateReport`：
+
+| 字段 | 含义 |
+|---|---|
+| `added` / `removed` | 本次**实际**新增 / 删除的位置（升序） |
+| `added_duplicates` / `removed_missing` | 重复增 / 缺失删（无变化）的位置 |
+| `old_rank` / `new_rank` | 更新前后结构秩（加边不减、删边不增） |
+| `changed` | 边集是否真的变化 |
+| `decomposition` | 更新后的完整 `StructuralDecomposition` 证书 |
+
 ## 错误语义（可定位，不静默纠正）
 
 - 下标必须是 `int`：**`bool` 被明确拒绝**（`True`/`False` 不当作 1/0），
   普通 `float` 下标拒绝（`TypeError`），`float('nan')`/`float('inf')`
   拒绝（`InvalidStructureError`）；维度、`budget` 参数同规则。
 - 负下标、坐标对长度 ≠ 2、位置超出显式维度：`InvalidStructureError`，
-  错误信息带可定位前缀，如 `entries[7] 的列号: ...`。
+  错误信息带可定位前缀，如 `entries[7] 的列号: ...`；批量更新中为
+  `add[3] ...` / `remove[1] ...`。
 - 行号 ≥ 100 或列号 ≥ 100、维度 > 100：`LimitExceededError`。
-- 分析是纯函数：任何校验失败都在构造结果前抛出，**不存在部分变更**；
-  输入可迭代对象不会被就地修改。
+- 分析与更新都是“先校验、后提交”：任何校验失败都在构造结果前抛出，
+  **不存在部分变更**；输入可迭代对象不会被就地修改。
 
 ## 设计取舍
 
@@ -113,6 +165,11 @@ d = analyze(entries, n_rows=None, n_cols=None, *, budget=None)
 6. **证书可核验**：匹配、置换、区域、块边界全部显式返回，`verify()`
    独立重算；测试中的期望值来自 `tests/reference.py` 的**回溯枚举所有匹配**
    与传递闭包 SCC（小矩阵专用），该参考不导入被测库；往返一致仅作补充。
+7. **动态批量更新是全量重算**：`StructuralModel.update()` 复用静态路径
+   （同一 `_decompose`），因此“动态结果 == 静态结果”是构造性保证，不做
+   增广路的动态局部维护（本期非目标）；维度一旦因加边扩大便不再收缩，
+   空行 / 空列始终显式保留，与 `analyze(entries, n_rows, n_cols)` 的显式
+   维度语义一致。
 
 ## 已知限制 / 非目标
 
@@ -122,16 +179,22 @@ d = analyze(entries, n_rows=None, n_cols=None, *, budget=None)
 - 维度硬上限 100×100；超出即拒绝，不做大规模稀疏的伸缩优化。
 - 块三角化的块顺序是拓扑序之一（确定性的一种），不保证对所有可能的
   拓扑序做枚举；不可约块（SCC）本身的划分是唯一的。
-- `budget` 是搜索中断机制而非性能契约；预算耗尽时无结果返回（纯函数，
-  无部分状态）。
+- `budget` 是搜索中断机制而非性能契约；预算耗尽时无结果返回（静态为纯
+  函数、动态为原子不提交，均无部分状态）。
+- 动态更新每次整批重算，不维护跨更新的增量匹配/增量分区；无操作历史、
+  版本号或撤销接口；维度只扩不缩（需要“收缩”时用 `analyze(model.edges())`
+  重新推断维度构造新模型）。
 - 不提供网站 / CLI 产品 / 报表；终端命令仅用于测试与演示。
 
 ## 仓库结构
 
 ```
-sparsestruct/__init__.py   # 本题库：校验、最大匹配、DM 分区、SCC、verify
+sparsestruct/__init__.py   # 本题库：校验、最大匹配、DM 分区、SCC、verify、
+                           # StructuralModel 批量增删与全量重算
 tests/reference.py         # 独立参考：枚举所有匹配 + 传递闭包 SCC（不导入核心）
-tests/test_sparsestruct.py # 必要测试
-demo.py                    # 固定输入演示（确定性数据，真实计算）
+tests/test_sparsestruct.py # 静态入口必要测试（原样保留）
+tests/test_dynamic.py      # 动态批量更新测试：匹配边删除、空行、矩形、
+                           # 非法更新原子性、枚举参考随机游走
+demo.py                    # 固定输入演示（静态 + 动态，确定性数据，真实计算）
 README.md
 ```

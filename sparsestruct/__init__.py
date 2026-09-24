@@ -21,6 +21,8 @@ __all__ = [
     "SearchBudgetExhausted",
     "Block",
     "StructuralDecomposition",
+    "UpdateReport",
+    "StructuralModel",
     "analyze",
     "verify",
 ]
@@ -208,10 +210,53 @@ def _as_budget(value) -> Optional[int]:
     return value
 
 
+def _check_pair(pair, where):
+    """校验单个坐标对：长度必须为 2，下标必须为有限非负 int。
+
+    ``where`` 是可定位前缀，如 ``"entries[7]"`` / ``"add[0]"``。
+    """
+    if isinstance(pair, (str, bytes)):
+        raise TypeError(f"{where}: 坐标对不能是 str/bytes")
+    try:
+        length = len(pair)
+    except TypeError:
+        raise TypeError(
+            f"{where}: 每个元素必须是含 2 个下标的对"
+        ) from None
+    if length != 2:
+        raise InvalidStructureError(
+            f"{where}: 坐标对长度必须为 2，收到 {length}"
+        )
+    r = _as_index(pair[0], f"{where} 的行号")
+    c = _as_index(pair[1], f"{where} 的列号")
+    if r >= MAX_ROWS:
+        raise LimitExceededError(
+            f"{where} 行号 {r} 超过上限 {MAX_ROWS - 1}"
+        )
+    if c >= MAX_COLS:
+        raise LimitExceededError(
+            f"{where} 列号 {c} 超过上限 {MAX_COLS - 1}"
+        )
+    return r, c
+
+
+def _check_edges_within(edge_set, n_rows, n_cols):
+    """所有非零位置必须在显式维度内，否则报可定位错误。"""
+    for (r, c) in edge_set:
+        if r >= n_rows:
+            raise InvalidStructureError(
+                f"非零位置 ({r}, {c}) 越界：行号 >= n_rows={n_rows}"
+            )
+        if c >= n_cols:
+            raise InvalidStructureError(
+                f"非零位置 ({r}, {c}) 越界：列号 >= n_cols={n_cols}"
+            )
+
+
 def _normalize(entries, n_rows, n_cols):
     """规范化输入：校验类型/范围，重复位置去重。
 
-    返回 ``(n_rows, n_cols, sorted adjacency, reverse adjacency, edge_set)``。
+    返回 ``(n_rows, n_cols, adjacency, reverse adjacency, edge_set)``。
     纯函数式：任何失败都抛出异常，不产生部分结果。
     """
     if n_rows is not None:
@@ -238,28 +283,7 @@ def _normalize(entries, n_rows, n_cols):
     max_r = -1
     max_c = -1
     for i, pair in enumerate(iterator):
-        if isinstance(pair, (str, bytes)):
-            raise TypeError(f"entries[{i}]: 坐标对不能是 str/bytes")
-        try:
-            length = len(pair)
-        except TypeError:
-            raise TypeError(
-                f"entries[{i}]: 每个元素必须是含 2 个下标的对"
-            ) from None
-        if length != 2:
-            raise InvalidStructureError(
-                f"entries[{i}]: 坐标对长度必须为 2，收到 {length}"
-            )
-        r = _as_index(pair[0], f"entries[{i}] 的行号")
-        c = _as_index(pair[1], f"entries[{i}] 的列号")
-        if r >= MAX_ROWS:
-            raise LimitExceededError(
-                f"entries[{i}] 行号 {r} 超过上限 {MAX_ROWS - 1}"
-            )
-        if c >= MAX_COLS:
-            raise LimitExceededError(
-                f"entries[{i}] 列号 {c} 超过上限 {MAX_COLS - 1}"
-            )
+        r, c = _check_pair(pair, f"entries[{i}]")
         edge_set.add((r, c))  # 重复非零位置在此去重
         if r > max_r:
             max_r = r
@@ -271,16 +295,14 @@ def _normalize(entries, n_rows, n_cols):
     if n_cols is None:
         n_cols = max_c + 1
 
-    for (r, c) in edge_set:
-        if r >= n_rows:
-            raise InvalidStructureError(
-                f"非零位置 ({r}, {c}) 越界：行号 >= n_rows={n_rows}"
-            )
-        if c >= n_cols:
-            raise InvalidStructureError(
-                f"非零位置 ({r}, {c}) 越界：列号 >= n_cols={n_cols}"
-            )
+    _check_edges_within(edge_set, n_rows, n_cols)
 
+    adj, radj = _build_adjacency(edge_set, n_rows, n_cols)
+    return n_rows, n_cols, adj, radj, frozenset(edge_set)
+
+
+def _build_adjacency(edge_set, n_rows, n_cols):
+    """由去重边集构造排序后的行/列邻接表。"""
     adj = [[] for _ in range(n_rows)]
     radj = [[] for _ in range(n_cols)]
     for r, c in edge_set:
@@ -290,7 +312,7 @@ def _normalize(entries, n_rows, n_cols):
         adj[r].sort()
     for c in range(n_cols):
         radj[c].sort()
-    return n_rows, n_cols, adj, radj, frozenset(edge_set)
+    return adj, radj
 
 
 # --------------------------------------------------------------------------- #
@@ -458,39 +480,13 @@ def _kosaraju(nodes, adjf):
     return components
 
 
-def analyze(
-    entries: Iterable[tuple[int, int]],
-    n_rows: Optional[int] = None,
-    n_cols: Optional[int] = None,
-    *,
-    budget: Optional[int] = None,
-) -> StructuralDecomposition:
-    """对非零位置集合做结构秩与块三角化分析。
+def _decompose(n_rows, n_cols, edge_set, budget):
+    """由已校验的去重边集计算完整结构分解。
 
-    Args:
-        entries: ``(row, col)`` 非零位置的可迭代集合；重复位置自动去重，
-            结果与传入顺序无关。下标必须为 ``int``（拒绝 bool）、非负且
-            不超过 99；拒绝 NaN/Infinity。
-        n_rows / n_cols: 可选显式维度（0..100）。省略时由最大下标 +1
-            推断（空集合推断为 0）。显式给定时，位置越界报
-            :class:`InvalidStructureError`。
-        budget: 可选交替路搜索预算（每考察一条二部边计 1）。``None``
-            （默认）表示完整搜索，必定给出证明后的最大匹配；非负整数在
-            预算耗尽时抛 :class:`SearchBudgetExhausted`，它*不*表示证明
-            无解。
-
-    Returns:
-        :class:`StructuralDecomposition` 证书。
-
-    Raises:
-        TypeError: 类型错误（含 bool 冒充 int、浮点下标）。
-        InvalidStructureError: 非法结构（NaN/Infinity、负数、越界、
-            坐标对长度不为 2 等），信息带可定位下标。
-        LimitExceededError: 超过 100×100 的接口边界。
-        SearchBudgetExhausted: 搜索预算耗尽（区别于证明无增广路）。
+    静态入口 :func:`analyze` 与动态入口 :class:`StructuralModel` 的全量
+    重算共用本函数，因此两条路径对同一边集给出*逐字段相同*的证书。
     """
-    budget = _as_budget(budget)
-    n_rows, n_cols, adj, radj, edge_set = _normalize(entries, n_rows, n_cols)
+    adj, radj = _build_adjacency(edge_set, n_rows, n_cols)
 
     rmatch, cmatch, rank = _maximum_matching(adj, n_rows, n_cols, budget)
 
@@ -566,7 +562,7 @@ def analyze(
     return StructuralDecomposition(
         n_rows=n_rows,
         n_cols=n_cols,
-        nonzeros=edge_set,
+        nonzeros=frozenset(edge_set),
         structural_rank=rank,
         row_match=tuple(rmatch),
         col_match=tuple(cmatch),
@@ -580,6 +576,42 @@ def analyze(
         row_region=tuple(row_region),
         col_region=tuple(col_region),
     )
+
+
+def analyze(
+    entries: Iterable[tuple[int, int]],
+    n_rows: Optional[int] = None,
+    n_cols: Optional[int] = None,
+    *,
+    budget: Optional[int] = None,
+) -> StructuralDecomposition:
+    """对非零位置集合做结构秩与块三角化分析。
+
+    Args:
+        entries: ``(row, col)`` 非零位置的可迭代集合；重复位置自动去重，
+            结果与传入顺序无关。下标必须为 ``int``（拒绝 bool）、非负且
+            不超过 99；拒绝 NaN/Infinity。
+        n_rows / n_cols: 可选显式维度（0..100）。省略时由最大下标 +1
+            推断（空集合推断为 0）。显式给定时，位置越界报
+            :class:`InvalidStructureError`。
+        budget: 可选交替路搜索预算（每考察一条二部边计 1）。``None``
+            （默认）表示完整搜索，必定给出证明后的最大匹配；非负整数在
+            预算耗尽时抛 :class:`SearchBudgetExhausted`，它*不*表示证明
+            无解。
+
+    Returns:
+        :class:`StructuralDecomposition` 证书。
+
+    Raises:
+        TypeError: 类型错误（含 bool 冒充 int、浮点下标）。
+        InvalidStructureError: 非法结构（NaN/Infinity、负数、越界、
+            坐标对长度不为 2 等），信息带可定位下标。
+        LimitExceededError: 超过 100×100 的接口边界。
+        SearchBudgetExhausted: 搜索预算耗尽（区别于证明无增广路）。
+    """
+    budget = _as_budget(budget)
+    n_rows, n_cols, _, _, edge_set = _normalize(entries, n_rows, n_cols)
+    return _decompose(n_rows, n_cols, edge_set, budget)
 
 
 # --------------------------------------------------------------------------- #
@@ -737,3 +769,241 @@ def verify(d: StructuralDecomposition) -> bool:
                     f"良定块 {k} 不是强连通分量（不可约块划分有误）"
                 )
     return True
+
+
+# --------------------------------------------------------------------------- #
+# 有状态批量更新（非零模式）
+# --------------------------------------------------------------------------- #
+
+_BUDGET_UNSET = object()
+
+
+@dataclass(frozen=True)
+class UpdateReport:
+    """一次批量更新（及随后全量重算）的变更账目与新证书。
+
+    Attributes:
+        added: 本次实际*新增*的位置（之前不存在），升序元组。
+        removed: 本次实际*删除*的位置（之前存在），升序元组。
+        added_duplicates: 出现在 add 中但模型里已存在、因此无变化的位置。
+        removed_missing: 出现在 remove 中但模型里本不存在、因此无变化的位置。
+        old_rank / new_rank: 更新前后的结构秩。
+        decomposition: 更新后的 :class:`StructuralDecomposition` 证书。
+    """
+
+    added: tuple[tuple[int, int], ...]
+    removed: tuple[tuple[int, int], ...]
+    added_duplicates: tuple[tuple[int, int], ...]
+    removed_missing: tuple[tuple[int, int], ...]
+    old_rank: int
+    new_rank: int
+    decomposition: StructuralDecomposition
+
+    @property
+    def changed(self) -> bool:
+        """边集是否真的发生了变化（忽略重复增 / 缺失删）。"""
+        return bool(self.added or self.removed)
+
+
+class StructuralModel:
+    """可批量增删非零边、随后全量重算的有状态结构模型。
+
+    语义：
+
+    * 每次 :meth:`update`（以及 :meth:`add_edges` / :meth:`remove_edges`）
+      先在*副本*上完成全部校验与边集修改，再做一次全量重算，成功后才
+      原子替换旧状态——任何非法输入或搜索预算耗尽都不会留下半更新状态，
+      :attr:`decomposition` 仍是上一次成功的结果；
+    * 重算走与静态入口 :func:`analyze` 完全相同的代码路径
+      （:func:`_decompose`），因此 ``model.decomposition`` 与
+      ``analyze(model.edges(), model.n_rows, model.n_cols)`` 逐字段一致；
+    * 同一位置在一次批次里同时增、删是歧义输入，直接拒绝
+      （:class:`InvalidStructureError`），不依赖批次内出现顺序；
+    * 删除不存在的边不是错误，记入报告的 ``removed_missing``；添加已存在
+      的边同理，记入 ``added_duplicates``。
+
+    维度语义：
+
+    * ``auto_dim``（默认）时维度为宽松边界：显式给出的 ``n_rows`` /
+      ``n_cols`` 只是初始下界，之后加边可自动扩大维度，删边不会缩小
+      （空行 / 空列作为显式维度的一部分保留）；
+    * ``auto_dim=False`` 时维度在构造时固定，加边越界报
+      :class:`InvalidStructureError`。
+    """
+
+    def __init__(
+        self,
+        entries: Iterable[tuple[int, int]] = (),
+        n_rows: Optional[int] = None,
+        n_cols: Optional[int] = None,
+        *,
+        auto_dim: bool = True,
+        budget: Optional[int] = None,
+    ):
+        if not isinstance(auto_dim, bool):
+            raise TypeError("auto_dim: 必须为 bool")
+        self._auto_dim = auto_dim
+        self._budget = _as_budget(budget)
+
+        # 复用静态入口的完整校验（含显式维度边界、NaN/bool 拒绝等），
+        # 得到首份证书；维度与边集从证书取得，保证初始状态即合法。
+        d = analyze(entries, n_rows, n_cols, budget=self._budget)
+        self._n_rows = d.n_rows
+        self._n_cols = d.n_cols
+        self._edges: set[tuple[int, int]] = set(d.nonzeros)
+        self._decomposition = d
+
+    # ----- 只读视图 ----------------------------------------------------- #
+
+    @property
+    def n_rows(self) -> int:
+        """当前行数（空行也计入，维度只扩不缩）。"""
+        return self._n_rows
+
+    @property
+    def n_cols(self) -> int:
+        """当前列数（空列也计入，维度只扩不缩）。"""
+        return self._n_cols
+
+    @property
+    def decomposition(self) -> StructuralDecomposition:
+        """最近一次成功重算的结构分解证书。"""
+        return self._decomposition
+
+    @property
+    def budget(self) -> Optional[int]:
+        """当前生效的搜索预算（``None`` 表示完整搜索）。"""
+        return self._budget
+
+    def edges(self) -> frozenset[tuple[int, int]]:
+        """当前去重非零位置集合的不可变快照。"""
+        return frozenset(self._edges)
+
+    def __len__(self) -> int:
+        return len(self._edges)
+
+    def __contains__(self, pair) -> bool:
+        try:
+            return pair in self._edges
+        except TypeError:
+            return False
+
+    # ----- 配置 --------------------------------------------------------- #
+
+    def set_budget(self, budget: Optional[int]) -> None:
+        """设置后续重算使用的搜索预算（立即校验，不触发重算）。"""
+        self._budget = _as_budget(budget)
+
+    # ----- 批量更新 ----------------------------------------------------- #
+
+    def update(
+        self,
+        add: Iterable[tuple[int, int]] = (),
+        remove: Iterable[tuple[int, int]] = (),
+        *,
+        budget=_BUDGET_UNSET,
+    ) -> UpdateReport:
+        """批量增、删非零边，然后全量重算，原子提交。
+
+        Args:
+            add: 要新增的 ``(row, col)`` 位置（重复自动去重）。
+            remove: 要删除的位置；删除不存在的边记为 ``removed_missing``，
+                不算错误。
+            budget: 本次重算的搜索预算；省略时沿用模型当前预算，
+                显式传 ``None`` 表示本次完整搜索。
+
+        Returns:
+            :class:`UpdateReport`：实际增/删账目与新证书。
+
+        Raises:
+            TypeError / InvalidStructureError / LimitExceededError:
+                非法坐标、批次内同一位置既增又删、固定维度下越界等。
+            SearchBudgetExhausted: 本次搜索预算耗尽；此时旧状态完整保留。
+        """
+        eff_budget = self._budget if budget is _BUDGET_UNSET else _as_budget(budget)
+
+        if add is None or remove is None:
+            raise TypeError(
+                "add/remove: 必须为可迭代的 (row, col) 对，不能为 None"
+            )
+        try:
+            add_list = list(add)
+        except TypeError:
+            raise TypeError("add: 必须为可迭代的 (row, col) 对") from None
+        try:
+            remove_list = list(remove)
+        except TypeError:
+            raise TypeError("remove: 必须为可迭代的 (row, col) 对") from None
+
+        # 第一阶段：校验全部坐标（错误信息可定位到批次内序号）。
+        add_pairs = [_check_pair(pair, f"add[{i}]") for i, pair in enumerate(add_list)]
+        rem_pairs = [
+            _check_pair(pair, f"remove[{i}]") for i, pair in enumerate(remove_list)
+        ]
+
+        add_set = set(add_pairs)
+        rem_set = set(rem_pairs)
+        conflict = add_set & rem_set
+        if conflict:
+            pos = sorted(conflict)[0]
+            raise InvalidStructureError(
+                f"同一位置 {pos} 在一个批次中既被添加又被删除（歧义更新）"
+            )
+
+        # 第二阶段：在副本上计算新边集与新维度，校验固定维度边界。
+        actually_added = add_set - self._edges
+        actually_removed = rem_set & self._edges
+        new_edges = (self._edges | add_set) - rem_set
+
+        new_n_rows = self._n_rows
+        new_n_cols = self._n_cols
+        if self._auto_dim:
+            for r, _ in add_set:
+                if r + 1 > new_n_rows:
+                    new_n_rows = r + 1
+            for _, c in add_set:
+                if c + 1 > new_n_cols:
+                    new_n_cols = c + 1
+        else:
+            for r, c in add_set:
+                if r >= new_n_rows or c >= new_n_cols:
+                    raise InvalidStructureError(
+                        f"添加位置 ({r}, {c}) 越界：固定维度 "
+                        f"{new_n_rows}x{new_n_cols}（auto_dim=False）"
+                    )
+
+        # 第三阶段：全量重算（可能抛 SearchBudgetExhausted）。此时尚未触碰
+        # 任何实例状态；成功后一次性提交，杜绝半更新。
+        new_d = _decompose(new_n_rows, new_n_cols, new_edges, eff_budget)
+
+        old_rank = self._decomposition.structural_rank
+        report = UpdateReport(
+            added=tuple(sorted(actually_added)),
+            removed=tuple(sorted(actually_removed)),
+            added_duplicates=tuple(sorted(add_set & self._edges)),
+            removed_missing=tuple(sorted(rem_set - self._edges)),
+            old_rank=old_rank,
+            new_rank=new_d.structural_rank,
+            decomposition=new_d,
+        )
+        self._edges = new_edges
+        self._n_rows = new_n_rows
+        self._n_cols = new_n_cols
+        self._decomposition = new_d
+        return report
+
+    def add_edges(self, entries: Iterable[tuple[int, int]], **kwargs) -> UpdateReport:
+        """只增批量入口，等价于 :meth:`update` 的 ``add=entries``。"""
+        return self.update(add=entries, **kwargs)
+
+    def remove_edges(self, entries: Iterable[tuple[int, int]], **kwargs) -> UpdateReport:
+        """只删批量入口，等价于 :meth:`update` 的 ``remove=entries``。"""
+        return self.update(remove=entries, **kwargs)
+
+    def recompute(self, *, budget=_BUDGET_UNSET) -> StructuralDecomposition:
+        """不改变边集，做一次全量重算（空批次）并返回新证书。
+
+        可用于切换预算后重新搜索，或核对结果与静态入口一致。
+        """
+        self.update((), (), budget=budget)
+        return self._decomposition
