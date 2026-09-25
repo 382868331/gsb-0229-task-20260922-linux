@@ -152,3 +152,19 @@ def reference_well_blocks(edges, rm, cm, well_rows):
         comp = frozenset(w for w in well_rows if w in reach[r] and r in reach[w])
         blocks[comp] = None
     return set(blocks.keys()), reach
+
+
+def reference_edge_criticality(edges, n_rows, n_cols):
+    """独立参考：对每个非零位置单独删除后枚举全部匹配求秩。
+
+    返回 {位置: (critical, rank_after)}。每次删除都基于原图，
+    是互不影响的独立试验；期望值完全来自回溯枚举，不导入被测库。
+    """
+    edges = sorted(set(edges))
+    _, _, base_rank = enumerate_max_matching(edges, n_rows, n_cols)
+    out = {}
+    for e in edges:
+        reduced = [x for x in edges if x != e]
+        _, _, rank_after = enumerate_max_matching(reduced, n_rows, n_cols)
+        out[e] = (rank_after < base_rank, rank_after)
+    return out

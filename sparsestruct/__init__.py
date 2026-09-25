@@ -21,8 +21,12 @@ __all__ = [
     "SearchBudgetExhausted",
     "Block",
     "StructuralDecomposition",
+    "EdgeCriticality",
+    "EdgeCriticalityReport",
     "analyze",
     "verify",
+    "edge_criticality",
+    "verify_criticality",
 ]
 
 #: 接口允许的最大行数（题面给定的硬边界）。
@@ -735,5 +739,395 @@ def verify(d: StructuralDecomposition) -> bool:
             if _reaches(src, members) != members:
                 raise StructuralError(
                     f"良定块 {k} 不是强连通分量（不可约块划分有误）"
+                )
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# 边关键性（edge criticality）：单独删除每个非零位置是否降低结构秩
+# --------------------------------------------------------------------------- #
+#
+# 理论依据（纯组合，不读数值）：
+#   在交替有向图 G_M 中（非匹配边 row -> col，匹配边 col -> row）：
+#   * 当前匹配未使用的边：删除后原匹配仍然合法，秩必不下降，绝不关键；
+#   * 匹配边 e=(r,c)：另一个最大匹配 M' 与 M 的对称差由交错环和偶长
+#     交错路径组成，因此存在不含 e 的最大匹配，当且仅当满足三者之一：
+#       1. e 在交错环上 <=> G_M 中有 r -> c 路径 <=> r 与 c 同 SCC
+#          （c -> r 弧恒存在；且 r 的唯一入弧就是这条匹配弧，从 r 出发
+#          的简单路径不会用到它，无需逐边删弧重算）；
+#       2. G_M 中 r 能到达某条未匹配列（沿交错路翻转后 c 变为未匹配，
+#          未匹配列被匹配，秩不变）——即 r 位于欠定区 U；
+#       3. G_M 中某条未匹配行能到达 c（对偶翻转）——即 c 位于过定区 O。
+#   因此一次交替图 SCC 分解加 DM 区域标签即可分类全部匹配边；只有被
+#   判定为关键的边才在独立删除后的图上重跑最大匹配，并用 König 最小
+#   顶点覆盖给出降秩上界证据。每个位置的删除都是基于原图的独立试验，
+#   互不累积。
+
+
+@dataclass(frozen=True)
+class EdgeCriticality:
+    """单个非零位置的独立删除试验结果。
+
+    Attributes:
+        position: 非零位置 (row, col)（原始坐标）。
+        critical: 单独删除该位置后结构秩是否下降。
+        rank_after_removal: 删除后的结构秩（不降 = 原秩，降 = 原秩 - 1）。
+        in_current_matching: 该位置是否被当前匹配证书使用。
+        alternative_matching: 非关键时的证据：删除后图上大小等于原秩的
+            匹配（不使用被删位置），边元组按行列升序。当前匹配未使用该
+            位置时即原匹配本身。
+        reduced_matching: 关键时的证据之一：删除后图上大小为原秩 - 1
+            的最大匹配。
+        vertex_cover_rows / vertex_cover_cols: 关键时的证据之二：删除后
+            图上的最小顶点覆盖（König），其大小等于原秩 - 1，证明删除后
+            任何匹配都不超过原秩 - 1（降秩上界）。
+    """
+
+    position: tuple[int, int]
+    critical: bool
+    rank_after_removal: int
+    in_current_matching: bool
+    alternative_matching: Optional[tuple[tuple[int, int], ...]] = None
+    reduced_matching: Optional[tuple[tuple[int, int], ...]] = None
+    vertex_cover_rows: Optional[tuple[int, ...]] = None
+    vertex_cover_cols: Optional[tuple[int, ...]] = None
+
+
+@dataclass(frozen=True)
+class EdgeCriticalityReport:
+    """全部非零位置的边关键性报告（各删除试验相互独立）。
+
+    Attributes:
+        n_rows / n_cols: 矩阵维度。
+        structural_rank: 原图结构秩。
+        entries: 每个非零位置一条 EdgeCriticality，按位置升序。
+    """
+
+    n_rows: int
+    n_cols: int
+    structural_rank: int
+    entries: tuple[EdgeCriticality, ...]
+
+    @property
+    def critical_positions(self) -> tuple[tuple[int, int], ...]:
+        """所有关键非零位置（删除后结构秩下降），按位置升序。"""
+        return tuple(e.position for e in self.entries if e.critical)
+
+    def entry(self, row: int, col: int) -> EdgeCriticality:
+        """按位置查询单个结果；位置不存在抛 KeyError。"""
+        for e in self.entries:
+            if e.position == (row, col):
+                return e
+        raise KeyError(f"({row}, {col}) 不是非零位置")
+
+
+def _alternating_graph(adj, rmatch, cmatch, n_rows, n_cols):
+    """构造交替有向图 G_M 的邻接表（复用内部分析）。
+
+    节点编号：行 0..n_rows-1，列 n_rows..n_rows+n_cols-1。
+    弧：非匹配边 row -> col；匹配边 col -> row。
+    """
+    graph: dict[int, list[int]] = {}
+    for r in range(n_rows):
+        graph[r] = [n_rows + c for c in adj[r] if c != rmatch[r]]
+    for c in range(n_cols):
+        graph[n_rows + c] = [cmatch[c]] if cmatch[c] != -1 else []
+    return graph
+
+
+def _find_path(graph, src, dst, targets=None):
+    """BFS 求 src -> dst（或 targets 中任一节点）的一条节点路径。"""
+    if targets is None:
+        targets = {dst}
+    if src in targets:
+        return [src]
+    parent = {src: None}
+    queue = deque([src])
+    while queue:
+        v = queue.popleft()
+        for w in graph.get(v, ()):
+            if w in parent:
+                continue
+            parent[w] = v
+            if w in targets:
+                path = [w]
+                while path[-1] is not src:
+                    path.append(parent[path[-1]])
+                path.reverse()
+                return path
+            queue.append(w)
+    return None
+
+
+def _reverse_graph(graph, n_total):
+    rev: dict[int, list[int]] = {v: [] for v in range(n_total)}
+    for v, outs in graph.items():
+        for w in outs:
+            rev[w].append(v)
+    return rev
+
+
+def _flip_along_path(rmatch, cmatch, path, n_rows):
+    """沿交错路径翻转匹配：path 是 G_M 中从行节点出发的节点路径
+    [r0, c1, r1, ..., rk, c_{k+1}]。把每条非匹配弧 r_i -> c_{i+1}
+    变为匹配边，返回 (row_match, col_match) 列表副本（调用方负责
+    处理路径另一端释放出的悬空端点）。"""
+    new_rm = list(rmatch)
+    new_cm = list(cmatch)
+    for i in range(0, len(path) - 1, 2):
+        r_i = path[i]
+        c_next = path[i + 1] - n_rows
+        new_rm[r_i] = c_next
+        new_cm[c_next] = r_i
+    return new_rm, new_cm
+
+
+def _matching_edges(rmatch):
+    return tuple(sorted((r, c) for r, c in enumerate(rmatch) if c != -1))
+
+
+def _konig_cover(adj, rmatch, cmatch, n_rows, n_cols):
+    """由最大匹配构造 König 最小顶点覆盖。
+
+    Z = 从未匹配行出发沿交替路（非匹配边 row->col，匹配边 col->row）
+    可达的顶点；覆盖 = （不在 Z 中的行） ∪ （在 Z 中的列），
+    其大小等于最大匹配基数。
+    """
+    z_rows: set[int] = set()
+    z_cols: set[int] = set()
+    queue = deque()
+    for r in range(n_rows):
+        if rmatch[r] == -1:
+            z_rows.add(r)
+            queue.append(("r", r))
+    while queue:
+        kind, v = queue.popleft()
+        if kind == "r":
+            for c in adj[v]:
+                if c == rmatch[v]:
+                    continue
+                if c not in z_cols:
+                    z_cols.add(c)
+                    queue.append(("c", c))
+        else:
+            r2 = cmatch[v]
+            if r2 != -1 and r2 not in z_rows:
+                z_rows.add(r2)
+                queue.append(("r", r2))
+    cover_rows = tuple(r for r in range(n_rows) if r not in z_rows)
+    cover_cols = tuple(c for c in range(n_cols) if c in z_cols)
+    return cover_rows, cover_cols
+
+
+def edge_criticality(d: StructuralDecomposition) -> EdgeCriticalityReport:
+    """对每个已存在非零位置做*独立*的单边删除试验。
+
+    判断单独删除该位置是否降低最大匹配大小（结构秩），并给出证据：
+    非关键位置给出删除后仍达到原秩的替代匹配；关键位置给出删除后的
+    最大匹配与最小顶点覆盖（大小 = 原秩 - 1，证明降秩上界）。
+
+    所有删除都基于原图，互不在前一次删除后的图上继续删。复用一次
+    交替图强连通分解完成全部分类，仅对关键边在删除后的图上重跑
+    最大匹配（独立试验）。
+
+    Args:
+        d: analyze() 返回的分解证书。
+
+    Returns:
+        EdgeCriticalityReport，可用 verify_criticality() 独立核验。
+    """
+    n_rows, n_cols = d.n_rows, d.n_cols
+    rank = d.structural_rank
+    rmatch = list(d.row_match)
+    cmatch = list(d.col_match)
+
+    adj = [[] for _ in range(n_rows)]
+    for r, c in d.nonzeros:
+        adj[r].append(c)
+    for r in range(n_rows):
+        adj[r].sort()
+
+    # 一次交替图 SCC 分解 + 反向图，分类所有匹配边。
+    graph = _alternating_graph(adj, rmatch, cmatch, n_rows, n_cols)
+    nodes = list(range(n_rows + n_cols))
+    comp_id: dict[int, int] = {}
+    for k, comp in enumerate(_kosaraju(nodes, graph)):
+        for v in comp:
+            comp_id[v] = k
+    rgraph = _reverse_graph(graph, n_rows + n_cols)
+    unmatched_col_nodes = {
+        n_rows + c for c in range(n_cols) if cmatch[c] == -1
+    }
+    unmatched_row_nodes = {r for r in range(n_rows) if rmatch[r] == -1}
+
+    def _alternative_for_matched(r, c):
+        """为匹配边 (r, c) 构造不含它的同基数匹配；不存在返回 None。"""
+        # 情形 1：交错环（r 与 c 同 SCC，等价于 r -> c 可达）。
+        if comp_id[r] == comp_id[n_rows + c]:
+            path = _find_path(graph, r, n_rows + c)
+            if path is None:  # 理论不可达：同 SCC 必有路径
+                raise StructuralError("内部错误：同一 SCC 内无交错路径")
+            return _flip_along_path(rmatch, cmatch, path, n_rows)
+        # 情形 2：r 可达某未匹配列，翻转后 c 释放为未匹配。
+        path = _find_path(graph, r, None, targets=unmatched_col_nodes)
+        if path is not None:
+            new_rm, new_cm = _flip_along_path(rmatch, cmatch, path, n_rows)
+            new_cm[c] = -1  # 原匹配列被释放
+            return new_rm, new_cm
+        # 情形 3：某未匹配行可达 c（反向 BFS），翻转后 r 释放为未匹配。
+        path = _find_path(rgraph, n_rows + c, None, targets=unmatched_row_nodes)
+        if path is not None:
+            path.reverse()  # 还原为 未匹配行 -> ... -> c 的正向路径
+            new_rm, new_cm = _flip_along_path(rmatch, cmatch, path, n_rows)
+            new_rm[r] = -1  # 原匹配行被释放
+            return new_rm, new_cm
+        return None
+
+    entries: list[EdgeCriticality] = []
+    for r, c in sorted(d.nonzeros):
+        if rmatch[r] != c:
+            # 当前匹配未使用该边：删除后原匹配仍合法，秩不下降。
+            entries.append(
+                EdgeCriticality(
+                    position=(r, c),
+                    critical=False,
+                    rank_after_removal=rank,
+                    in_current_matching=False,
+                    alternative_matching=_matching_edges(rmatch),
+                )
+            )
+            continue
+
+        alternative = _alternative_for_matched(r, c)
+        if alternative is not None:
+            entries.append(
+                EdgeCriticality(
+                    position=(r, c),
+                    critical=False,
+                    rank_after_removal=rank,
+                    in_current_matching=True,
+                    alternative_matching=_matching_edges(alternative[0]),
+                )
+            )
+            continue
+
+        # 关键边：在独立删除后的图上重跑最大匹配（不累积删除），
+        # 并用 König 最小顶点覆盖给出降秩上界证据。
+        del_adj = [list(cols) for cols in adj]
+        del_adj[r] = [c2 for c2 in del_adj[r] if c2 != c]
+        new_rm, new_cm, new_rank = _maximum_matching(
+            del_adj, n_rows, n_cols, None
+        )
+        if new_rank != rank - 1:  # 理论保证恰降 1
+            raise StructuralError("内部错误：关键边删除后秩变化异常")
+        cover_rows, cover_cols = _konig_cover(
+            del_adj, new_rm, new_cm, n_rows, n_cols
+        )
+        entries.append(
+            EdgeCriticality(
+                position=(r, c),
+                critical=True,
+                rank_after_removal=new_rank,
+                in_current_matching=True,
+                reduced_matching=_matching_edges(new_rm),
+                vertex_cover_rows=cover_rows,
+                vertex_cover_cols=cover_cols,
+            )
+        )
+
+    return EdgeCriticalityReport(
+        n_rows=n_rows,
+        n_cols=n_cols,
+        structural_rank=rank,
+        entries=tuple(entries),
+    )
+
+
+def _check_matching(edges, matching, n_rows, n_cols, expect_size, what):
+    """核验 matching 是 edges 上的合法匹配且大小为 expect_size。"""
+    used_rows: set[int] = set()
+    used_cols: set[int] = set()
+    for r, c in matching:
+        if not (0 <= r < n_rows and 0 <= c < n_cols):
+            raise StructuralError(f"{what}: 匹配边 ({r},{c}) 越界")
+        if (r, c) not in edges:
+            raise StructuralError(f"{what}: 匹配边 ({r},{c}) 不是非零边")
+        if r in used_rows or c in used_cols:
+            raise StructuralError(f"{what}: 匹配在 ({r},{c}) 处冲突")
+        used_rows.add(r)
+        used_cols.add(c)
+    if len(matching) != expect_size:
+        raise StructuralError(
+            f"{what}: 匹配大小 {len(matching)} != 期望 {expect_size}"
+        )
+
+
+def verify_criticality(
+    d: StructuralDecomposition, report: EdgeCriticalityReport
+) -> bool:
+    """独立核验边关键性报告的全部证据，失败抛 StructuralError。
+
+    核验内容：报告覆盖且仅覆盖全部非零位置；秩字段与原分解一致；
+    每个非关键位置的替代匹配是删除后图上大小等于原秩的合法匹配
+    （且不使用被删位置）；每个关键位置的降秩匹配合法，且顶点覆盖
+    覆盖删除后图的所有边、大小等于原秩 - 1（从而证明删除后任何
+    匹配都不超过原秩 - 1，降秩结论成立）。
+    """
+    n_rows, n_cols = d.n_rows, d.n_cols
+    rank = d.structural_rank
+    if report.structural_rank != rank:
+        raise StructuralError("报告结构秩与分解证书不一致")
+    if report.n_rows != n_rows or report.n_cols != n_cols:
+        raise StructuralError("报告维度与分解证书不一致")
+
+    positions = [e.position for e in report.entries]
+    if sorted(positions) != sorted(d.nonzeros) or len(set(positions)) != len(
+        positions
+    ):
+        raise StructuralError("报告未恰好覆盖每个非零位置一次")
+
+    for e in report.entries:
+        r, c = e.position
+        remaining = d.nonzeros - {(r, c)}
+        if e.critical:
+            if e.rank_after_removal != rank - 1:
+                raise StructuralError(
+                    f"位置 {e.position}: 关键边降秩后秩应为原秩 - 1"
+                )
+            if e.reduced_matching is None:
+                raise StructuralError(f"位置 {e.position}: 缺少降秩匹配证据")
+            _check_matching(
+                remaining, e.reduced_matching, n_rows, n_cols, rank - 1,
+                f"位置 {e.position} 的降秩匹配",
+            )
+            if e.vertex_cover_rows is None or e.vertex_cover_cols is None:
+                raise StructuralError(
+                    f"位置 {e.position}: 缺少最小顶点覆盖证据"
+                )
+            cover_r = set(e.vertex_cover_rows)
+            cover_c = set(e.vertex_cover_cols)
+            if len(cover_r) + len(cover_c) != rank - 1:
+                raise StructuralError(
+                    f"位置 {e.position}: 顶点覆盖大小不等于原秩 - 1"
+                )
+            for r2, c2 in remaining:
+                if r2 not in cover_r and c2 not in cover_c:
+                    raise StructuralError(
+                        f"位置 {e.position}: 顶点覆盖未覆盖边 ({r2},{c2})"
+                    )
+        else:
+            if e.rank_after_removal != rank:
+                raise StructuralError(
+                    f"位置 {e.position}: 非关键边删除后秩不应变化"
+                )
+            if e.alternative_matching is None:
+                raise StructuralError(f"位置 {e.position}: 缺少替代匹配证据")
+            _check_matching(
+                remaining, e.alternative_matching, n_rows, n_cols, rank,
+                f"位置 {e.position} 的替代匹配",
+            )
+            if (r, c) in e.alternative_matching:
+                raise StructuralError(
+                    f"位置 {e.position}: 替代匹配仍使用被删位置"
                 )
     return True

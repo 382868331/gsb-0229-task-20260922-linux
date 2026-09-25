@@ -21,7 +21,9 @@ from sparsestruct import (
     InvalidStructureError,
     SearchBudgetExhausted,
     analyze,
+    edge_criticality,
     verify,
+    verify_criticality,
 )
 
 REGION_CN = {"U": "欠定(U)", "W": "良定(W)", "O": "过定(O)"}
@@ -111,6 +113,67 @@ def show_normal_result(elapsed_limit=8.0):
     assert elapsed + verify_elapsed < elapsed_limit
 
 
+def show_edge_criticality(elapsed_limit=90.0):
+    print("\n" + "=" * 68)
+    print("边关键性：每个非零位置的独立单删试验（复用一次交替图 SCC 分析）")
+    print("=" * 68)
+    edges = build_demo_matrix()
+    d = analyze(edges, 10, 10)
+
+    t0 = time.perf_counter()
+    report = edge_criticality(d)
+    elapsed = time.perf_counter() - t0
+
+    print(f"非零位置数: {len(report.entries)}，结构秩: {report.structural_rank}")
+    print(f"关键位置（单独删除即降秩）: {list(report.critical_positions)}")
+
+    n_crit = 0
+    for e in report.entries:
+        tag = "关键" if e.critical else "非关键"
+        used = "匹配边" if e.in_current_matching else "未用边"
+        print(f"  {e.position}: {tag}（{used}），删后秩={e.rank_after_removal}")
+        if e.critical:
+            n_crit += 1
+            print(f"    降秩证据: 删后最大匹配 {list(e.reduced_matching)}")
+            print(f"    最小顶点覆盖: 行{list(e.vertex_cover_rows)} "
+                  f"列{list(e.vertex_cover_cols)}"
+                  f"（大小 {len(e.vertex_cover_rows) + len(e.vertex_cover_cols)}"
+                  f" = 秩-1，证明删后上界）")
+
+    # 展示一条“在当前匹配里却可被替代”的匹配边及其替代匹配。
+    for e in report.entries:
+        if e.in_current_matching and not e.critical:
+            print(f"  示例: {e.position} 在当前匹配里但非关键，"
+                  f"替代匹配 {list(e.alternative_matching)}")
+            break
+
+    t1 = time.perf_counter()
+    verify_criticality(d, report)  # 独立核验全部替代匹配与顶点覆盖证据
+    verify_elapsed = time.perf_counter() - t1
+    print(f"verify_criticality() 独立核验: 通过"
+          f"（分析 {elapsed*1000:.2f} ms，核验 {verify_elapsed*1000:.2f} ms，"
+          f"关键边 {n_crit} 条）")
+
+    # 第二个确定性小例：含一条桥接匹配边，展示降秩证据。
+    print("\n含桥接匹配边的 4x4 小例：")
+    edges2 = [(0, 0), (0, 1), (1, 0), (1, 1), (1, 2), (2, 3), (3, 2)]
+    d2 = analyze(edges2, 4, 4)
+    report2 = edge_criticality(d2)
+    print(f"  结构秩: {d2.structural_rank}，"
+          f"关键位置: {list(report2.critical_positions)}")
+    for pos in report2.critical_positions:
+        e = report2.entry(*pos)
+        print(f"  {pos}: 删后秩={e.rank_after_removal}，"
+              f"降秩匹配 {list(e.reduced_matching)}")
+        print(f"    最小顶点覆盖: 行{list(e.vertex_cover_rows)} "
+              f"列{list(e.vertex_cover_cols)}"
+              f"（大小 {len(e.vertex_cover_rows) + len(e.vertex_cover_cols)}"
+              f" = 秩-1）")
+    verify_criticality(d2, report2)
+    print("  verify_criticality() 独立核验: 通过")
+    assert elapsed + verify_elapsed < elapsed_limit
+
+
 def show_rejection_boundary():
     print("\n" + "=" * 68)
     print("异常边界 1：NaN 坐标必须被拒绝（不静默纠正）")
@@ -143,6 +206,7 @@ def show_budget_boundary():
 def main():
     t0 = time.perf_counter()
     show_normal_result()
+    show_edge_criticality()
     show_rejection_boundary()
     show_budget_boundary()
     print("\n演示完成，总耗时 %.2f 秒。" % (time.perf_counter() - t0))

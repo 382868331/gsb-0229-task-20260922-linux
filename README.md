@@ -30,6 +30,10 @@ python demo.py
 ```python
 from sparsestruct import analyze, verify, StructuralDecomposition, Block
 from sparsestruct import (
+    edge_criticality, verify_criticality,
+    EdgeCriticalityReport, EdgeCriticality,
+)
+from sparsestruct import (
     StructuralError,            # 本库错误基类（ValueError 子类）
     InvalidStructureError,      # 非法结构
     LimitExceededError,          # 超过 100×100 接口边界
@@ -67,6 +71,39 @@ d = analyze(entries, n_rows=None, n_cols=None, *, budget=None)
 
 方法：`iter_blocks()` 返回 `Block`（含块形状与块内原始行列号）；
 `permuted_nonzeros()` 返回置换后坐标的非零位置；`spy()` 返回 ASCII 散点图。
+
+### `edge_criticality(decomposition) -> EdgeCriticalityReport`
+
+对分解证书中的**每个已存在非零位置**做一次*独立*的单边删除试验
+（所有删除都基于原图，互不在前一次删除后的图上继续删），判断单独删除
+该位置是否降低最大匹配大小，并给出可独立核验的证据：
+
+- 复用一次交替有向图 G_M 的强连通分解与 DM 区域标签完成全部分类，
+  不为所有边盲目重跑整个分解：当前匹配未使用的边必不关键（原匹配即
+  证据）；匹配边 (r,c) 非关键当且仅当 r 与 c 同 SCC（交错环）、或 r
+  可达未匹配列（欠定侧翻转）、或未匹配行可达 c（过定侧翻转）。
+- 只有被判定为**关键**的边才在删除后的图上重跑一次最大匹配
+  （独立试验），并用 König 最小顶点覆盖给出降秩上界证据。
+
+报告字段：`structural_rank`（原图结构秩）、`entries`（每个非零位置
+一条 `EdgeCriticality`，按位置升序）、`critical_positions`（全部关键
+位置）、`entry(row, col)`（按位置查询，非非零位置抛 `KeyError`）。
+每条 `EdgeCriticality`：
+
+| 字段 | 含义 |
+|---|---|
+| `position` | 非零位置 `(row, col)`（原始坐标） |
+| `critical` | 单独删除后结构秩是否下降 |
+| `rank_after_removal` | 删除后的结构秩（不降=原秩，降=原秩-1） |
+| `in_current_matching` | 是否被当前匹配证书使用（**在匹配里 ≠ 必不可少**） |
+| `alternative_matching` | 非关键证据：删后图上大小=原秩的匹配（不含被删位置） |
+| `reduced_matching` | 关键证据：删后图上大小=原秩-1 的最大匹配 |
+| `vertex_cover_rows` / `vertex_cover_cols` | 关键证据：删后图最小顶点覆盖，大小=原秩-1，证明删后上界 |
+
+`verify_criticality(decomposition, report)` 独立核验全部证据：非关键
+位置的替代匹配确为删后图上大小等于原秩的合法匹配；关键位置的顶点
+覆盖覆盖删后图所有边且大小等于原秩-1（降秩上界成立）。失败抛
+`StructuralError`，成功返回 `True`。
 
 ### `verify(decomposition) -> True`
 
@@ -124,14 +161,20 @@ d = analyze(entries, n_rows=None, n_cols=None, *, budget=None)
   拓扑序做枚举；不可约块（SCC）本身的划分是唯一的。
 - `budget` 是搜索中断机制而非性能契约；预算耗尽时无结果返回（纯函数，
   无部分状态）。
+- 边关键性只回答“单独删除一条边”的独立试验，不做多条边同时删除的
+  组合关键性，也不是在线增删维护（每次调用基于给定分解证书静态计算）。
+  分类复用一次交替图 SCC 分析；仅关键边各重跑一次删除后图上的最大
+  匹配，最坏复杂度 O(E) 条关键边 × O(V·E)，100×100 内为毫秒级。
 - 不提供网站 / CLI 产品 / 报表；终端命令仅用于测试与演示。
 
 ## 仓库结构
 
 ```
 sparsestruct/__init__.py   # 本题库：校验、最大匹配、DM 分区、SCC、verify
+                            #   及 edge_criticality / verify_criticality
 tests/reference.py         # 独立参考：枚举所有匹配 + 传递闭包 SCC（不导入核心）
 tests/test_sparsestruct.py # 必要测试
+tests/test_edge_criticality.py # 边关键性测试（逐边删除枚举核对分类与见证）
 demo.py                    # 固定输入演示（确定性数据，真实计算）
 README.md
 ```
