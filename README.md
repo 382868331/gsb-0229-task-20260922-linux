@@ -5,6 +5,11 @@
 Dulmage–Mendelsohn 可达性划分欠定 / 良定 / 过定三区，并对良定匹配图做
 强连通分量（SCC）块三角排序，输出行列置换、块边界与可独立核验的匹配证书。
 
+新增 **边关键性（edge criticality）**：对每个已存在非零位置做*独立*的
+单边删除试验，判断删除它是否降低结构秩，并给出替代匹配（非关键）或
+最大匹配 + König 最小顶点覆盖（关键）的降秩证据。多次删除互不影响，
+每次都从原始图出发，不在前一次删除后的图上继续删。
+
 - **Python 版本**：Python 3.14.7（仅使用标准库，`dataclasses` / `collections` / `math`）
 - **依赖**：无第三方依赖，安装 Python 后即可运行；核心、测试、演示全部离线
 - **输入上限**：矩阵维度与下标为接口硬边界：行数、列数均 ≤ **100**，
@@ -37,7 +42,10 @@ from sparsestruct import (
 )
 
 d = analyze(entries, n_rows=None, n_cols=None, *, budget=None)
+rep = edge_criticality(entries, n_rows=None, n_cols=None, *, budget=None)
 ```
+（`edge_criticality` 与数据类 `EdgeCriticality` / `EdgeCriticalityReport`
+同样从 `sparsestruct` 导入。）
 
 ### `analyze(entries, n_rows=None, n_cols=None, *, budget=None)`
 
@@ -69,6 +77,37 @@ d = analyze(entries, n_rows=None, n_cols=None, *, budget=None)
 `permuted_nonzeros()` 返回置换后坐标的非零位置；`spy()` 返回 ASCII 散点图。
 
 ### `verify(decomposition) -> True`
+
+### `edge_criticality(entries, n_rows=None, n_cols=None, *, budget=None)`
+
+对每个已存在非零位置做**独立的单边删除试验**（每次删除都从原始图出发，
+不在前一次删除后的图上继续删；这不是在线增删维护）。参数、校验与错误
+语义与 `analyze` 完全相同。返回 `EdgeCriticalityReport`：
+
+| 字段 | 含义 |
+|---|---|
+| `decomposition` | 原图的结构分解证书（与 `analyze(...)` 结果一致，原块三角化接口全部保留） |
+| `structural_rank` | 原图结构秩 |
+| `edges` | 每个非零位置一条 `EdgeCriticality`，按 `(row, col)` 升序 |
+
+方法：`by_position()` 按 `(row, col)` 索引；`critical_edges` 给出全部
+关键边位置。每条 `EdgeCriticality`：
+
+| 字段 | 含义 |
+|---|---|
+| `row`, `col` | 非零位置 |
+| `critical` | 删除该位置后结构秩是否下降 |
+| `in_original_matching` | 该边是否在分析所用的那个最大匹配里（**在当前匹配里 ≠ 必不可少**） |
+| `rank_after_removal` | 删除后的结构秩（关键边为原秩 -1，否则等于原秩） |
+| `alternative_matching` | 非关键时的见证：一个避开该边的最大匹配（`row_match` 元组） |
+| `vertex_cover` | 关键时的降秩证据：删除后图中的最小顶点覆盖 `(覆盖行, 覆盖列)`，大小 = 删除后的秩，由 König 定理给出删除后最大匹配数的上界 |
+
+分类只复用**一次**结构分析（最大匹配 + 交替有向图 SCC + 未匹配点
+可达性）：非匹配边以当前匹配为替代；匹配边若在交替环上（两端同 SCC）
+或在从未匹配行/列出发的交替路径上（欠定/过定区），沿环/路径翻转得到
+替代匹配；只有既不在交替环上又不在自由点交替路径上的匹配边（良定区
+桥接边）才判定为关键，并仅对这类边单独重跑删除后的最大匹配以构造
+König 覆盖证据。原匹配并非唯一，某边在当前匹配里不等于它必不可少。
 
 独立重算核验证书（与主算法共享图模型但搜索代码独立）：
 
@@ -113,6 +152,13 @@ d = analyze(entries, n_rows=None, n_cols=None, *, budget=None)
 6. **证书可核验**：匹配、置换、区域、块边界全部显式返回，`verify()`
    独立重算；测试中的期望值来自 `tests/reference.py` 的**回溯枚举所有匹配**
    与传递闭包 SCC（小矩阵专用），该参考不导入被测库；往返一致仅作补充。
+7. **边关键性复用一次分解**：交替有向图 D（非匹配边 行→列、匹配边
+   列→行）上，匹配边非关键当且仅当它在交替环上（两端同 SCC）或在从
+   未匹配行/列出发的交替路径上（欠定/过定区）；三种情形分别沿环/路径
+   翻转构造替代匹配。其余匹配边（良定区桥接边）必为所有最大匹配共有，
+   删除后秩恰降 1，仅对它们重跑删除后的匹配并用 König 构造给出最小
+   顶点覆盖作为降秩上界证据。测试对随机小图逐边独立删除、用枚举匹配
+   参考核对分类与见证。
 
 ## 已知限制 / 非目标
 
@@ -124,12 +170,17 @@ d = analyze(entries, n_rows=None, n_cols=None, *, budget=None)
   拓扑序做枚举；不可约块（SCC）本身的划分是唯一的。
 - `budget` 是搜索中断机制而非性能契约；预算耗尽时无结果返回（纯函数，
   无部分状态）。
+- 边关键性判定的是**结构**（组合）意义的关键性：只问“删除该位置后最大
+  匹配基数是否下降”，不涉及数值偶然消去，也不做在线增删维护；每次删除
+  试验相互独立，不支持“累计删除多条边”的复合查询（可多次调用本接口
+  自行组合）。
 - 不提供网站 / CLI 产品 / 报表；终端命令仅用于测试与演示。
 
 ## 仓库结构
 
 ```
 sparsestruct/__init__.py   # 本题库：校验、最大匹配、DM 分区、SCC、verify
+                           #   及 edge_criticality（边关键性，复用同一分解）
 tests/reference.py         # 独立参考：枚举所有匹配 + 传递闭包 SCC（不导入核心）
 tests/test_sparsestruct.py # 必要测试
 demo.py                    # 固定输入演示（确定性数据，真实计算）

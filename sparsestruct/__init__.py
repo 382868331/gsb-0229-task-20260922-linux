@@ -21,7 +21,10 @@ __all__ = [
     "SearchBudgetExhausted",
     "Block",
     "StructuralDecomposition",
+    "EdgeCriticality",
+    "EdgeCriticalityReport",
     "analyze",
+    "edge_criticality",
     "verify",
 ]
 
@@ -583,6 +586,12 @@ def analyze(
 
 
 # --------------------------------------------------------------------------- #
+# 边关键性（edge criticality）：单独删除每个非零位置的独立试验
+# --------------------------------------------------------------------------- #
+
+
+
+# --------------------------------------------------------------------------- #
 # 证书核验（独立重算，供调用方与 demo 使用）
 # --------------------------------------------------------------------------- #
 
@@ -737,3 +746,358 @@ def verify(d: StructuralDecomposition) -> bool:
                     f"良定块 {k} 不是强连通分量（不可约块划分有误）"
                 )
     return True
+
+
+# --------------------------------------------------------------------------- #
+# 边关键性（edge criticality）：单独删除每个非零位置的独立试验
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class EdgeCriticality:
+    """单个非零位置的删除试验结果。
+
+    每次删除都是*独立*试验：始终从原始图删去这一条边，绝不在前一次
+    删除后的图上继续删。
+
+    Attributes:
+        row / col: 非零位置坐标。
+        critical: 删除该位置后结构秩是否下降。
+        in_original_matching: 该边是否在分析所用的那个最大匹配里。
+            注意这只是当前匹配的选择，*不*意味着必不可少。
+        rank_after_removal: 删除后的结构秩（critical 时为原秩 -1，
+            否则等于原秩）。
+        alternative_matching: 非关键时的见证：一个避开该边的最大匹配
+            （row_match 元组）。关键时为 ``None``。
+        vertex_cover: 关键时的降秩证据：删除后图中的一个最小顶点覆盖
+            ``(覆盖行元组, 覆盖列元组)``，其大小 = rank_after_removal，
+            由 König 定理给出删除后最大匹配的上界。非关键时为 ``None``。
+    """
+
+    row: int
+    col: int
+    critical: bool
+    in_original_matching: bool
+    rank_after_removal: int
+    alternative_matching: Optional[tuple[int, ...]]
+    vertex_cover: Optional[tuple[tuple[int, ...], tuple[int, ...]]]
+
+
+@dataclass(frozen=True)
+class EdgeCriticalityReport:
+    """全部非零位置的边关键性报告。
+
+    Attributes:
+        decomposition: 原始图的结构分解证书（复用同一次分析）。
+        structural_rank: 原图结构秩。
+        edges: 每个非零位置一条 :class:`EdgeCriticality`，按 (row, col)
+            升序，与输入顺序无关。
+    """
+
+    decomposition: StructuralDecomposition
+    structural_rank: int
+    edges: tuple[EdgeCriticality, ...]
+
+    def by_position(self) -> dict[tuple[int, int], EdgeCriticality]:
+        """以 ``(row, col)`` 为键索引各条试验结果。"""
+        return {(e.row, e.col): e for e in self.edges}
+
+    @property
+    def critical_edges(self) -> tuple[tuple[int, int], ...]:
+        """所有关键边（删除后降秩）的位置，升序。"""
+        return tuple((e.row, e.col) for e in self.edges if e.critical)
+
+
+def _alternating_sccs(adj, rmatch, cmatch, n_rows, n_cols):
+    """交替有向图 D 的 SCC 编号。
+
+    节点编码：行 r -> r，列 c -> n_rows + c。
+    边：非匹配边 row -> col，匹配边 col -> row。
+    返回 (comp, adjf)：comp[v] 为分量编号，adjf 为 D 的邻接表。
+    """
+    nodes = list(range(n_rows + n_cols))
+    adjf: dict[int, list[int]] = {v: [] for v in nodes}
+    for r in range(n_rows):
+        for c in adj[r]:
+            if c == rmatch[r]:
+                adjf[n_rows + c].append(r)  # 匹配边 col -> row
+            else:
+                adjf[r].append(n_rows + c)  # 非匹配边 row -> col
+    for v in nodes:
+        adjf[v].sort()
+    comp: dict[int, int] = {}
+    for k, members in enumerate(_kosaraju(nodes, adjf)):
+        for v in members:
+            comp[v] = k
+    return comp, adjf
+
+
+def _path_in_digraph(adjf, src, dst):
+    """BFS 求 src 到 dst 的一条节点路径（含端点）；不存在返回 None。"""
+    if src == dst:
+        return [src]
+    prev = {src: None}
+    queue = deque([src])
+    while queue:
+        v = queue.popleft()
+        for w in adjf[v]:
+            if w not in prev:
+                prev[w] = v
+                if w == dst:
+                    path = [w]
+                    while path[-1] != src:
+                        path.append(prev[path[-1]])
+                    path.reverse()
+                    return path
+                queue.append(w)
+    return None
+
+
+def _flip_along_cycle(rmatch, path, n_rows):
+    """沿交替环翻转匹配。
+
+    path 是 D 中 r -> ... -> c 的交替路径，与匹配边 (r, c) 合成交替环；
+    翻转后得到避开 (r, c) 的同基数最大匹配（row_match 元组）。
+    """
+    rm = list(rmatch)
+    # path 交替为 行,列,行,列,...,列；逐对 (行节点, 列节点) 改为匹配。
+    for i in range(0, len(path) - 1, 2):
+        rm[path[i]] = path[i + 1] - n_rows
+    return tuple(rm)
+
+
+def _konig_cover(adj, rmatch, cmatch, n_rows, n_cols):
+    """由最大匹配构造最小顶点覆盖（König 定理的标准构造）。
+
+    Z 为从未匹配行出发沿交替路（非匹配边 row->col，匹配边 col->row）
+    可达的顶点集合；覆盖 = 不在 Z 中的行 ∪ 在 Z 中的列，
+    其大小等于匹配基数。
+    """
+    z_rows: set[int] = set()
+    z_cols: set[int] = set()
+    queue = deque()
+    for r in range(n_rows):
+        if rmatch[r] == -1:
+            z_rows.add(r)
+            queue.append(("r", r))
+    while queue:
+        kind, v = queue.popleft()
+        if kind == "r":
+            for c in adj[v]:
+                if c == rmatch[v]:
+                    continue
+                if c not in z_cols:
+                    z_cols.add(c)
+                    queue.append(("c", c))
+        else:
+            r2 = cmatch[v]
+            if r2 != -1 and r2 not in z_rows:
+                z_rows.add(r2)
+                queue.append(("r", r2))
+    cover_rows = tuple(r for r in range(n_rows) if r not in z_rows)
+    cover_cols = tuple(sorted(z_cols))
+    return cover_rows, cover_cols
+
+
+def _path_from_any(adjf, sources, dst):
+    """BFS 求从 sources 中任一点到 dst 的一条节点路径；无则 None。"""
+    prev = {s: None for s in sources}
+    queue = deque(sources)
+    while queue:
+        v = queue.popleft()
+        if v == dst:
+            path = [v]
+            while prev[path[-1]] is not None:
+                path.append(prev[path[-1]])
+            path.reverse()
+            return path
+        for w in adjf[v]:
+            if w not in prev:
+                prev[w] = v
+                queue.append(w)
+    return None
+
+
+def _path_to_any_of(adjf, src, targets):
+    """BFS 求 src 到 targets 中任一点的一条节点路径；无则 None。"""
+    prev = {src: None}
+    queue = deque([src])
+    while queue:
+        v = queue.popleft()
+        if v in targets:
+            path = [v]
+            while prev[path[-1]] is not None:
+                path.append(prev[path[-1]])
+            path.reverse()
+            return path
+        for w in adjf[v]:
+            if w not in prev:
+                prev[w] = v
+                queue.append(w)
+    return None
+
+
+def _flip_path_from_free_row(rmatch, path, n_rows):
+    """沿“未匹配行 -> ... -> r”的交替路径翻转，并摘下匹配边 (r, c)。
+
+    path 节点为 行,列,行,...,行（终点 r）。翻转后未匹配行变为匹配、
+    列 c 变为未匹配，匹配基数不变，且 (r, c) 不再被使用。
+    """
+    rm = list(rmatch)
+    for i in range(0, len(path) - 1, 2):
+        rm[path[i]] = path[i + 1] - n_rows
+    rm[path[-1]] = -1
+    return tuple(rm)
+
+
+def _flip_path_to_free_col(rmatch, path, n_rows):
+    """沿“c -> ... -> 未匹配列”的交替路径翻转，并摘下匹配边 (r, c)。
+
+    path 节点为 列,行,列,...,列（起点 c 的唯一出边是匹配边 c -> r）。
+    翻转后 r 改配下一列、原未匹配列变为匹配，匹配基数不变。
+    """
+    rm = list(rmatch)
+    for i in range(1, len(path) - 1, 2):
+        rm[path[i]] = path[i + 1] - n_rows
+    return tuple(rm)
+
+
+def edge_criticality(
+    entries: Iterable[tuple[int, int]],
+    n_rows: Optional[int] = None,
+    n_cols: Optional[int] = None,
+    *,
+    budget: Optional[int] = None,
+) -> EdgeCriticalityReport:
+    """对每个已存在非零位置做*独立*的单边删除试验。
+
+    判定删除该位置是否降低结构秩（最大匹配基数），并给出见证：
+
+    * 非关键：给出一个避开该边的最大匹配（替代匹配）。注意“该边在
+      当前匹配里”不等于必不可少——只要它处在交替环上，或处在从未
+      匹配行/列出发的交替路径上（欠定/过定区），翻转即得替代匹配。
+    * 关键：重算删除后的最大匹配（秩恰为原秩 -1），并给出删除后图中
+      大小等于该秩的最小顶点覆盖（König 证据），以此上界证明降秩。
+
+    实现复用一次结构分析（最大匹配 + 交替图 SCC + 自由点可达性）
+    完成全部分类，只对被判定为关键的边单独重跑删除后的匹配；所有
+    删除试验相互独立，都从原始图出发，不在前一次删除后的图上继续删。
+
+    参数、校验与错误语义同 :func:`analyze`；报告中的
+    ``decomposition`` 保留原有块三角化接口的全部字段。
+    """
+    d = analyze(entries, n_rows, n_cols, budget=budget)
+    n_rows, n_cols = d.n_rows, d.n_cols
+    rank = d.structural_rank
+    rmatch = list(d.row_match)
+    cmatch = list(d.col_match)
+
+    adj = [[] for _ in range(n_rows)]
+    for r, c in d.nonzeros:
+        adj[r].append(c)
+    for r in range(n_rows):
+        adj[r].sort()
+
+    # 一次交替图分析（SCC + 自由点可达性）复用于所有边的分类，
+    # 不为每条边重跑整个分解。
+    comp_id, d_adj = _alternating_sccs(adj, rmatch, cmatch, n_rows, n_cols)
+    free_rows = [r for r in range(n_rows) if rmatch[r] == -1]
+    free_cols = {n_rows + c for c in range(n_cols) if cmatch[c] == -1}
+    # 未匹配行/列出发的前向可达节点集合（过定区/欠定区一侧）。
+    def _forward_reach(sources):
+        seen = set(sources)
+        queue = deque(sources)
+        while queue:
+            v = queue.popleft()
+            for w in d_adj[v]:
+                if w not in seen:
+                    seen.add(w)
+                    queue.append(w)
+        return seen
+
+    reach_from_free_row = _forward_reach(free_rows)
+    # 反向可达未匹配列 <=> 在反转图上从 free_cols 前向可达。
+    d_rad: dict[int, list[int]] = {v: [] for v in d_adj}
+    for v, ws in d_adj.items():
+        for w in ws:
+            d_rad[w].append(v)
+    reach_to_free_col: set[int] = set(free_cols)
+    queue = deque(free_cols)
+    while queue:
+        v = queue.popleft()
+        for w in d_rad[v]:
+            if w not in reach_to_free_col:
+                reach_to_free_col.add(w)
+                queue.append(w)
+
+    results: list[EdgeCriticality] = []
+    for r, c in sorted(d.nonzeros):
+        in_matching = rmatch[r] == c
+        if not in_matching:
+            # 当前匹配本身就是避开该边的最大匹配。
+            results.append(
+                EdgeCriticality(
+                    row=r,
+                    col=c,
+                    critical=False,
+                    in_original_matching=False,
+                    rank_after_removal=rank,
+                    alternative_matching=tuple(rmatch),
+                    vertex_cover=None,
+                )
+            )
+            continue
+        # 匹配边非关键 <=> 在交替环上（同 SCC），或在从未匹配行/列
+        # 出发的交替路径上（欠定/过定区）。三种情形都能构造替代匹配。
+        alt = None
+        if comp_id[r] == comp_id[n_rows + c]:
+            path = _path_in_digraph(d_adj, r, n_rows + c)
+            if path is None:  # 理论不可达
+                raise StructuralError("内部错误：同 SCC 但无交替路径")
+            alt = _flip_along_cycle(rmatch, path, n_rows)
+        elif r in reach_from_free_row:
+            path = _path_from_any(d_adj, free_rows, r)
+            alt = _flip_path_from_free_row(rmatch, path, n_rows)
+        elif n_rows + c in reach_to_free_col:
+            path = _path_to_any_of(d_adj, n_rows + c, free_cols)
+            alt = _flip_path_to_free_col(rmatch, path, n_rows)
+        if alt is not None:
+            results.append(
+                EdgeCriticality(
+                    row=r,
+                    col=c,
+                    critical=False,
+                    in_original_matching=True,
+                    rank_after_removal=rank,
+                    alternative_matching=alt,
+                    vertex_cover=None,
+                )
+            )
+            continue
+        # 良定区且不在交替环上的匹配边：所有最大匹配都含它，删除后
+        # 秩恰降 1。仅对这类边重跑删除后的匹配取 König 证据。
+        adj2 = [list(a) for a in adj]
+        adj2[r] = [x for x in adj2[r] if x != c]
+        rm2, cm2, rank2 = _maximum_matching(adj2, n_rows, n_cols, budget)
+        if rank2 != rank - 1:  # 理论不可达：删一边至多降 1，且该边必不可少
+            raise StructuralError("内部错误：关键边删除后秩变化异常")
+        cover = _konig_cover(adj2, rm2, cm2, n_rows, n_cols)
+        if len(cover[0]) + len(cover[1]) != rank2:
+            raise StructuralError("内部错误：König 覆盖大小与匹配不符")
+        results.append(
+            EdgeCriticality(
+                row=r,
+                col=c,
+                critical=True,
+                in_original_matching=True,
+                rank_after_removal=rank2,
+                alternative_matching=None,
+                vertex_cover=cover,
+            )
+        )
+
+    return EdgeCriticalityReport(
+        decomposition=d,
+        structural_rank=rank,
+        edges=tuple(results),
+    )

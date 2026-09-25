@@ -23,6 +23,7 @@ from sparsestruct import (
     analyze,
     verify,
 )
+from sparsestruct import edge_criticality
 
 REGION_CN = {"U": "欠定(U)", "W": "良定(W)", "O": "过定(O)"}
 
@@ -145,7 +146,36 @@ def main():
     show_normal_result()
     show_rejection_boundary()
     show_budget_boundary()
+    show_edge_criticality()
     print("\n演示完成，总耗时 %.2f 秒。" % (time.perf_counter() - t0))
+
+
+def show_edge_criticality():
+    print("\n" + "=" * 68)
+    print("边关键性：逐边独立删除试验（每次删除都从原图出发）")
+    print("=" * 68)
+    # 4x4：左侧一条桥接匹配路径 r0-c0-r1-c1（两条关键边），
+    # 右侧一个 K2,2 交替环（匹配边在当前匹配里，但删了也不降秩）。
+    edges = [(0, 0), (1, 0), (1, 1),
+             (2, 2), (2, 3), (3, 2), (3, 3)]
+    t0 = time.perf_counter()
+    rep = edge_criticality(edges, 4, 4)
+    elapsed = time.perf_counter() - t0
+    print(f"矩阵 4x4，非零位置 {len(edges)} 个，结构秩 {rep.structural_rank}")
+    print(f"关键边（删除后降秩）: {list(rep.critical_edges)}")
+    for e in rep.edges:
+        if e.critical:
+            rows, cols = e.vertex_cover
+            print(f"  ({e.row},{e.col}) 关键：删除后秩 {e.rank_after_removal}，"
+                  f"König 覆盖证据 行{list(rows)}+列{list(cols)} "
+                  f"（大小 {len(rows) + len(cols)} = 删除后秩的上界）")
+        else:
+            tag = "在当前匹配中" if e.in_original_matching else "不在当前匹配中"
+            print(f"  ({e.row},{e.col}) 非关键（{tag}）："
+                  f"替代匹配 {e.alternative_matching}")
+    verify(rep.decomposition)
+    print(f"原块三角化证书 verify() 通过；分析耗时 {elapsed*1000:.2f} ms")
+    assert elapsed < 90
 
 
 if __name__ == "__main__":

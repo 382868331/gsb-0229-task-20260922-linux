@@ -23,6 +23,7 @@ from sparsestruct import (  # noqa: E402
     analyze,
     verify,
 )
+from sparsestruct import edge_criticality  # noqa: E402
 
 from reference import (  # noqa: E402
     count_perfect_matchings,
@@ -757,3 +758,154 @@ class CertificateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class EdgeCriticalityTests(unittest.TestCase):
+    """边关键性：逐边独立删除试验的分类与见证。
+
+    参考值由 tests/reference.py 的枚举匹配在“删除该边后的图”上独立
+    重算得到；每次删除都从原图出发（独立试验）。
+    """
+
+    def _check_witness(self, edge_set, n, rec, rank):
+        """核验单条边的见证：替代匹配或 König 最小顶点覆盖。"""
+        if rec.critical:
+            self.assertIsNone(rec.alternative_matching)
+            self.assertEqual(rec.rank_after_removal, rank - 1)
+            cover_rows, cover_cols = rec.vertex_cover
+            # 覆盖大小 == 删除后的秩，给出删除后匹配数的上界证明。
+            self.assertEqual(len(cover_rows) + len(cover_cols), rank - 1)
+            remaining = edge_set - {(rec.row, rec.col)}
+            for (r, c) in remaining:
+                self.assertTrue(
+                    r in cover_rows or c in cover_cols,
+                    f"边 ({r},{c}) 未被顶点覆盖",
+                )
+        else:
+            self.assertIsNone(rec.vertex_cover)
+            self.assertEqual(rec.rank_after_removal, rank)
+            alt = rec.alternative_matching
+            self.assertEqual(len(alt), n)
+            # 替代匹配必须避开被删除的这条边。
+            self.assertNotEqual(alt[rec.row], rec.col)
+            used_cols = set()
+            matched = 0
+            for r, c in enumerate(alt):
+                if c == -1:
+                    continue
+                matched += 1
+                self.assertIn((r, c), edge_set)
+                self.assertNotIn(c, used_cols)
+                used_cols.add(c)
+            self.assertEqual(matched, rank)
+
+    def _brute_force_check(self, edges, n, m):
+        """逐边独立删除 + 枚举匹配，核对分类、秩与见证。"""
+        edge_set = set(map(tuple, edges))
+        rep = edge_criticality(edges, n, m)
+        # 原块三角化接口保留且证书自洽。
+        verify(rep.decomposition)
+        self.assertEqual(rep.structural_rank, rep.decomposition.structural_rank)
+        self.assertEqual(len(rep.edges), len(edge_set))
+        self.assertEqual(
+            [(e.row, e.col) for e in rep.edges], sorted(edge_set)
+        )
+        by_pos = rep.by_position()
+        for (r, c) in sorted(edge_set):
+            rec = by_pos[(r, c)]
+            remaining = [e for e in sorted(edge_set) if e != (r, c)]
+            _, _, ref_rank = enumerate_max_matching(remaining, n, m)
+            with self.subTest(edge=(r, c), edges=sorted(edge_set)):
+                self.assertEqual(rec.critical, ref_rank < rep.structural_rank)
+                self.assertEqual(rec.rank_after_removal, ref_rank)
+                self._check_witness(edge_set, n, rec, rep.structural_rank)
+        return rep
+    def test_perfect_matching_cycle_no_critical_edge(self):
+        # 偶环 C4：两个完美匹配，每条边都在交替环上，删任一边秩不变。
+        edges = [(i, i) for i in range(4)] + [(i, (i + 1) % 4) for i in range(4)]
+        self.assertEqual(count_perfect_matchings(edges, 4), 2)
+        rep = self._brute_force_check(edges, 4, 4)
+        self.assertEqual(rep.structural_rank, 4)
+        self.assertEqual(rep.critical_edges, ())
+        # 每条边（含当前匹配中的边）都有替代匹配见证。
+        for rec in rep.edges:
+            self.assertIsNotNone(rec.alternative_matching)
+
+    def test_single_bridge_matching(self):
+        # 路径 r0-c0-r1-c1：唯一最大匹配 {(0,0),(1,1)}，两条匹配边皆关键。
+        edges = [(0, 0), (1, 0), (1, 1)]
+        rep = self._brute_force_check(edges, 2, 2)
+        self.assertEqual(rep.structural_rank, 2)
+        self.assertEqual(set(rep.critical_edges), {(0, 0), (1, 1)})
+        # 非匹配边 (1,0) 删除后秩不变。
+        self.assertFalse(rep.by_position()[(1, 0)].critical)
+        # 关键边的降秩证据：大小为 1 的顶点覆盖。
+        cover = rep.by_position()[(0, 0)].vertex_cover
+        self.assertEqual(len(cover[0]) + len(cover[1]), 1)
+
+    def test_matched_edge_not_necessarily_essential(self):
+        # K2,2 全满：当前匹配含 (0,0)，但它在交替环上，并非必不可少。
+        edges = [(0, 0), (0, 1), (1, 0), (1, 1)]
+        rep = self._brute_force_check(edges, 2, 2)
+        self.assertEqual(rep.critical_edges, ())
+        # 每条边都在某个最大匹配里，但没有一条必不可少。
+        for rec in rep.edges:
+            self.assertFalse(rec.critical)
+            self.assertNotEqual(rec.alternative_matching[rec.row], rec.col)
+        self.assertTrue(any(e.in_original_matching for e in rep.edges))
+
+    def test_rectangular_underdetermined(self):
+        # 2x3 欠定矩形：删任一边秩仍为 2。
+        edges = [(r, c) for r in range(2) for c in range(3)]
+        rep = self._brute_force_check(edges, 2, 3)
+        self.assertEqual(rep.structural_rank, 2)
+        self.assertEqual(rep.critical_edges, ())
+
+    def test_structural_rank_zero(self):
+        # 结构秩为零：没有非零位置，报告为空。
+        rep = edge_criticality([], 3, 3)
+        self.assertEqual(rep.structural_rank, 0)
+        self.assertEqual(rep.edges, ())
+        self.assertEqual(rep.critical_edges, ())
+        verify(rep.decomposition)
+        self.assertEqual(rep.critical_edges, ())
+        verify(rep.decomposition)
+
+    def test_random_small_graphs_brute_force(self):
+        # 随机小图：逐边独立删除后枚举匹配，全面核对分类与见证。
+        import random
+        rng = random.Random(20260922)
+        for _ in range(30):
+            n = rng.randint(1, 4)
+            m = rng.randint(1, 4)
+            edges = [
+                (r, c)
+                for r in range(n)
+                for c in range(m)
+                if rng.random() < 0.5
+            ]
+            self._brute_force_check(edges, n, m)
+
+    def test_decomposition_matches_analyze(self):
+        # 报告中的分解与 analyze() 完全一致（原接口保留）。
+        edges = [(0, 0), (1, 0), (1, 1), (2, 2), (2, 3), (3, 2)]
+        rep = edge_criticality(edges, 4, 4)
+        self.assertEqual(rep.decomposition, analyze(edges, 4, 4))
+
+    def test_order_independence_and_immutability(self):
+        edges = [(0, 0), (1, 0), (1, 1), (2, 2)]
+        rep1 = edge_criticality(edges, 3, 3)
+        rep2 = edge_criticality(list(reversed(edges)), 3, 3)
+        self.assertEqual(rep1, rep2)
+        with self.assertRaises(Exception):
+            rep1.edges[0].critical = False  # frozen dataclass
+
+    def test_validation_and_budget_semantics(self):
+        # 校验与 analyze 一致：NaN 拒绝；预算耗尽与证明无解分开。
+        with self.assertRaises(InvalidStructureError):
+            edge_criticality([(0, float("nan"))], 1, 1)
+        with self.assertRaises(TypeError):
+            edge_criticality([(True, 0)], 1, 1)
+        dense = [(r, c) for r in range(4) for c in range(4)]
+        with self.assertRaises(SearchBudgetExhausted):
+            edge_criticality(dense, 4, 4, budget=2)
