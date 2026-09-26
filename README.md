@@ -1,42 +1,56 @@
-# 稀疏矩阵的结构秩与块三角化（sparsestruct）
+# 稀疏矩阵的结构秩、块三角化与最少专用输入选址（sparsestruct）
 
 离线稀疏数值预处理用的**纯组合结构分析**库：只读取非零元的位置，不读取、
 推断或消元任何数值。基于行列二部图的最大匹配求**结构秩**，按
 Dulmage–Mendelsohn 可达性划分欠定 / 良定 / 过定三区，并对良定匹配图做
 强连通分量（SCC）块三角排序，输出行列置换、块边界与可独立核验的匹配证书。
+此外把方阵非零模式视作状态有向图，给出**结构可控**所需的**最少专用输入
+选址**：每个输入只直接作用于一个状态，同时满足最大匹配未匹配点覆盖与
+源强连通分量可达两条要求（不只是数结构秩缺口）。
 
 - **Python 版本**：Python 3.14.7（仅使用标准库，`dataclasses` / `collections` / `math`）
 - **依赖**：无第三方依赖，安装 Python 后即可运行；核心、测试、演示全部离线
 - **输入上限**：矩阵维度与下标为接口硬边界：行数、列数均 ≤ **100**，
-  下标范围 0..99；非零位置数量无单独上限（至多 100×100=10000 个去重位置）
+  输入选址接口的状态数（方阵阶数）≤ **20**
 - **浮点口径**：本库的输入是整数位置、输出是离散的置换/分区/块边界，
   **不产生任何浮点结果，因此不存在浮点误差或容差**。唯一接触浮点数的地方
   是输入校验：`NaN` / `Infinity` 一律拒绝（见“错误语义”）
 
-## 运行命令
+## 环境准备与运行命令
 
 ```bash
-# 必要测试（独立枚举参考 + 结构检查），约 0.03 秒
+# 准备 venv（可选；库只用标准库，系统 Python 3.14.7 亦可直接运行）
+python3.14 -m venv .venv
+source .venv/bin/activate
+
+# 必要测试（独立枚举参考 + 结构检查），约 0.3 秒
 python -m unittest discover -s tests -v
 
-# 固定输入演示：正常结果（含不可约块）+ 两个实际触发的异常边界，约 0.1 秒内
+# 固定输入演示一：结构秩与块三角化（不可约块 + 异常边界），约 0.1 秒内
 python demo.py
+
+# 固定输入演示二：最少专用输入选址（满秩多孤立环 / 链 / 零矩阵 / 混合 +
+# 实际触发的异常边界），全部现场计算，远低于 90 秒
+python demo_iteration.py
 ```
 
-两条命令都不需要网络、账号、密钥、数据库或任何额外安装。
+三条命令都不需要网络、账号、密钥、数据库、Docker 或任何额外安装。
 
 ## 公开接口
 
 ```python
 from sparsestruct import analyze, verify, StructuralDecomposition, Block
 from sparsestruct import (
+    select_dedicated_inputs, InputPlacement,
+    MAX_STATES,                  # 输入选址状态数上限 20
     StructuralError,            # 本库错误基类（ValueError 子类）
     InvalidStructureError,      # 非法结构
-    LimitExceededError,          # 超过 100×100 接口边界
+    LimitExceededError,          # 超过接口边界（100×100 / 20 状态）
     SearchBudgetExhausted,       # 搜索预算耗尽（不等于证明无解）
 )
 
 d = analyze(entries, n_rows=None, n_cols=None, *, budget=None)
+p = select_dedicated_inputs(entries, n_states=None)
 ```
 
 ### `analyze(entries, n_rows=None, n_cols=None, *, budget=None)`
@@ -67,6 +81,35 @@ d = analyze(entries, n_rows=None, n_cols=None, *, budget=None)
 
 方法：`iter_blocks()` 返回 `Block`（含块形状与块内原始行列号）；
 `permuted_nonzeros()` 返回置换后坐标的非零位置；`spy()` 返回 ASCII 散点图。
+
+### `select_dedicated_inputs(entries, n_states=None)`
+
+把 n 阶方阵的非零模式视作状态有向图：非零元 `(i, j)`（A[i][j] ≠ 0）表示
+有向边 `j -> i`（状态 j 直接影响状态 i）。求**结构可控**所需的最少专用
+输入选址——每个输入只直接作用于一个状态（B 的列为单位向量）。
+
+- `entries`：`(i, j)` 非零位置可迭代集合，校验与去重规则同 `analyze`。
+- `n_states`：可选显式方阵阶数 0..20；省略时取行列两个方向推断值的
+  较大者。超过 20 报 `LimitExceededError`。
+- 返回不可变的 `InputPlacement`：
+
+| 字段 | 含义 |
+|---|---|
+| `states` | 选中的输入状态（升序）；并列时取状态 ID 集合字典序最小者 |
+| `n_inputs` | 最少输入数 = `max(源 SCC 数, n - 结构秩)` |
+| `structural_rank` / `rank_deficiency` | 结构秩与秩缺口 |
+| `row_match` / `col_match` / `unmatched_states` | 匹配证据：删去所选行后其余行全部被匹配，未匹配行恰好是所选状态 |
+| `source_sccs` | 状态有向图的全部源 SCC（无外部入边的强连通分量） |
+| `scc_coverage` | 与 `source_sccs` 对齐：每个源 SCC 被哪个输入状态覆盖 |
+
+可行性判据（Lin 1974 专用输入情形）同时要求两条，**不能只数结构秩缺口**：
+
+1. 可达性：每个源 SCC 至少含一个被选状态；
+2. 无膨胀：删去被选状态对应的行后，剩余行在行列二部图中全部可匹配。
+
+实现按规模从小到大、同规模按状态 ID 升序枚举候选集合，首个可行者即
+答案，因此并列时自动给出字典序最小的状态集合。该结论是*结构*（通用）
+可控性，**不代替**对具体数值矩阵的可控性判断（如 PBH 判据）。
 
 ### `verify(decomposition) -> True`
 
@@ -119,6 +162,12 @@ d = analyze(entries, n_rows=None, n_cols=None, *, budget=None)
 - 仅实现本题契约的数学子集：输入为二值的非零位置集合，不读数值、不计算
   数值秩、不做符号/容差判断，也不宣称兼容 Harwell-Boeing、Matrix Market
   等行业格式。
+- 输入选址是**结构可控性**结论：只回答“非零模式允许可控”，不代替对
+  具体数值矩阵的可控性判断；某些数值矩阵即使模式可行也可能数值不可控。
+- 输入选址状态数硬上限 20；候选集合按字典序枚举，病态图（下界接近
+  n/2 且大量候选不可行）下枚举可能明显变慢，演示与测试规模均在毫秒级。
+- 只支持专用输入（每个输入作用于单个状态），不处理多状态共享输入的
+  一般选址问题。
 - 维度硬上限 100×100；超出即拒绝，不做大规模稀疏的伸缩优化。
 - 块三角化的块顺序是拓扑序之一（确定性的一种），不保证对所有可能的
   拓扑序做枚举；不可约块（SCC）本身的划分是唯一的。
@@ -129,9 +178,11 @@ d = analyze(entries, n_rows=None, n_cols=None, *, budget=None)
 ## 仓库结构
 
 ```
-sparsestruct/__init__.py   # 本题库：校验、最大匹配、DM 分区、SCC、verify
-tests/reference.py         # 独立参考：枚举所有匹配 + 传递闭包 SCC（不导入核心）
-tests/test_sparsestruct.py # 必要测试
-demo.py                    # 固定输入演示（确定性数据，真实计算）
+sparsestruct/__init__.py      # 本题库：校验、最大匹配、DM 分区、SCC、verify、输入选址
+tests/reference.py            # 独立参考：枚举匹配 + 传递闭包 SCC + 枚举输入集合（不导入核心）
+tests/test_sparsestruct.py    # 结构秩与块三角化测试
+tests/test_input_placement.py # 输入选址测试（独立参考对照 + 异常路径）
+demo.py                       # 块三角化演示（确定性数据，真实计算）
+demo_iteration.py             # 最少专用输入选址演示（现场计算，< 90 秒）
 README.md
 ```

@@ -152,3 +152,81 @@ def reference_well_blocks(edges, rm, cm, well_rows):
         comp = frozenset(w for w in well_rows if w in reach[r] and r in reach[w])
         blocks[comp] = None
     return set(blocks.keys()), reach
+
+
+# --------------------------------------------------------------------------- #
+# 输入选址独立参考（小图枚举，禁止导入 sparsestruct）
+# --------------------------------------------------------------------------- #
+
+
+def reference_source_sccs(edges, n):
+    """独立求状态有向图的源 SCC。
+
+    非零元 (i, j) 表示边 j -> i。用逐点 BFS 可达闭包判定互相可达
+    （传递闭包法，与核心的 Kosaraju 完全独立），源 SCC = 无外部入边
+    的分量。返回按最小顶点升序的分量元组（块内升序）。
+    """
+    succ = [set() for _ in range(n)]
+    for i, j in edges:
+        succ[j].add(i)
+    reach = []
+    for s in range(n):
+        seen = {s}
+        dq = deque([s])
+        while dq:
+            v = dq.popleft()
+            for w in succ[v]:
+                if w not in seen:
+                    seen.add(w)
+                    dq.append(w)
+        reach.append(seen)
+    comp_of = [None] * n
+    comps = []
+    for v in range(n):
+        if comp_of[v] is not None:
+            continue
+        comp = tuple(sorted(w for w in range(n) if v in reach[w] and w in reach[v]))
+        idx = len(comps)
+        comps.append(comp)
+        for w in comp:
+            comp_of[w] = idx
+    has_in = [False] * len(comps)
+    for j in range(n):
+        for i in succ[j]:
+            if comp_of[i] != comp_of[j]:
+                has_in[comp_of[i]] = True
+    sources = [comps[k] for k in range(len(comps)) if not has_in[k]]
+    return tuple(sorted(sources, key=lambda c: c[0]))
+
+
+def reference_feasible_input_set(edges, n, states):
+    """独立判定专用输入集合 states 是否使系统结构可控。
+
+    两条独立条件：
+      1. 可达性：每个源 SCC 至少含一个被选状态；
+      2. 无膨胀：删去被选行后，剩余行可被完全匹配（用本文件独立的
+         回溯枚举匹配判定，不依赖核心算法）。
+    """
+    states = frozenset(states)
+    for comp in reference_source_sccs(edges, n):
+        if states.isdisjoint(comp):
+            return False
+    kept = [(i, j) for (i, j) in edges if i not in states]
+    _, _, size = enumerate_max_matching(kept, n, n)
+    return size == n - len(states)
+
+
+def reference_min_dedicated_inputs(edges, n):
+    """枚举全部输入集合，返回 (最少个数, 字典序最小状态元组)。
+
+    按规模从小到大、同规模按状态 ID 升序元组字典序枚举，第一个可行
+    集合即答案——枚举本身就是“最少”的证明。
+    """
+    from itertools import combinations
+
+    edges = sorted(set(edges))
+    for k in range(n + 1):
+        for cand in combinations(range(n), k):
+            if reference_feasible_input_set(edges, n, cand):
+                return k, cand
+    raise AssertionError("全状态集合必然可行，不应到达这里")

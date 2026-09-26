@@ -1,8 +1,13 @@
-"""稀疏矩阵的结构秩与块三角化（纯组合结构分析，不做任何数值消元）。
+"""稀疏矩阵的结构秩、块三角化与最少专用输入选址（纯组合结构分析）。
 
-公开接口见 :func:`analyze` 与 :class:`StructuralDecomposition`。
+公开接口：
+  * analyze / StructuralDecomposition：结构秩与块三角化；
+  * select_dedicated_inputs / InputPlacement：把方阵非零模式视作状态
+    有向图，求结构可控所需的最少专用输入选址（每个输入只直接作用于
+    一个状态）。
 本模块只读取非零元的*位置*，从不读取或推断数值，因此结构结论是精确的
-离散结论，不涉及浮点误差。
+离散结论，不涉及浮点误差。结构可控是通用（generic）结论，不代替对具体
+数值矩阵的可控性判断。
 """
 
 from __future__ import annotations
@@ -21,14 +26,18 @@ __all__ = [
     "SearchBudgetExhausted",
     "Block",
     "StructuralDecomposition",
+    "InputPlacement",
     "analyze",
     "verify",
+    "select_dedicated_inputs",
 ]
 
 #: 接口允许的最大行数（题面给定的硬边界）。
 MAX_ROWS = 100
 #: 接口允许的最大列数（题面给定的硬边界）。
 MAX_COLS = 100
+#: 输入选址接口允许的最大状态数（方阵维度硬边界）。
+MAX_STATES = 20
 
 _U = "U"  # underdetermined 欠定区（列多于行）
 _W = "W"  # well-determined 良定区（方阵块）
@@ -737,3 +746,189 @@ def verify(d: StructuralDecomposition) -> bool:
                     f"良定块 {k} 不是强连通分量（不可约块划分有误）"
                 )
     return True
+
+
+# --------------------------------------------------------------------------- #
+# 最少专用输入选址（结构可控性）
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class InputPlacement:
+    """最少专用输入选址证书。
+
+    把 n 阶方阵 A 的非零模式视作状态有向图：非零元 (i, j)（即
+    A[i][j] != 0）表示有向边 j -> i（状态 j 直接影响状态 i）。
+    每个专用输入只直接作用于一个状态（B 的列是单位向量 e_s）。
+
+    结构可控的充要条件（Lin 1974，专用输入情形）同时满足两条：
+      1. 可达性：状态有向图的每个源 SCC（无外部入边的强连通分量）
+         中至少有一个状态装了输入；
+      2. 无膨胀（满结构秩增广）：删去输入所在状态对应的*行*后，
+         剩余行在行列二部图中全部能被匹配，即存在匹配使未匹配行恰好
+         是所选状态。最少输入数 k = max(源 SCC 数, n - 结构秩)，
+         不能只数结构秩缺口。
+
+    Attributes:
+        n_states: 方阵阶数 n。
+        states: 选中的输入状态（升序元组）；并列时取状态 ID 集合
+            字典序最小者（按升序元组逐位比较）。
+        structural_rank: 原 n 阶模式的结构秩（最大匹配基数）。
+        row_match / col_match: 见证匹配：二部图（行 i、列 j，边为
+            非零元 (i, j)）上的一个匹配，删去 states 中的行后其余行
+            全部被匹配；未匹配为 -1，两侧互逆。
+        unmatched_states: 该见证匹配的未匹配行（恰好等于 states）。
+        source_sccs: 状态有向图的全部源 SCC，每个分量内状态升序，
+            分量按其最小状态升序排列。
+        scc_coverage: 与 source_sccs 对齐的元组，每项为覆盖该源
+            SCC 的输入状态（分量内被选状态的最小者）。
+    """
+
+    n_states: int
+    states: tuple[int, ...]
+    structural_rank: int
+    row_match: tuple[int, ...]
+    col_match: tuple[int, ...]
+    unmatched_states: tuple[int, ...]
+    source_sccs: tuple[tuple[int, ...], ...]
+    scc_coverage: tuple[int, ...]
+
+    @property
+    def n_inputs(self) -> int:
+        """专用输入个数（最少值）。"""
+        return len(self.states)
+
+    @property
+    def n_source_sccs(self) -> int:
+        """状态有向图的源 SCC 个数（可达性下界）。"""
+        return len(self.source_sccs)
+
+    @property
+    def rank_deficiency(self) -> int:
+        """结构秩缺口 n - structural_rank（膨胀下界）。"""
+        return self.n_states - self.structural_rank
+
+
+def _source_sccs_of_state_graph(n, succ):
+    """状态有向图的 SCC 与源 SCC 下标。
+
+    succ[j] 为边 j -> i 的后继 i 列表。返回 (components, source_ids)：
+    components 为按最小顶点升序的 SCC 列表（块内顶点升序），source_ids
+    为其中无外部入边的分量下标（升序）。
+    """
+    nodes = list(range(n))
+    adjf = {v: sorted(succ[v]) for v in nodes}
+    components = _kosaraju(nodes, adjf)
+    comp_of = {}
+    for idx, comp in enumerate(components):
+        for v in comp:
+            comp_of[v] = idx
+    has_external_in = [False] * len(components)
+    for j in nodes:
+        cj = comp_of[j]
+        for i in adjf[j]:
+            ci = comp_of[i]
+            if ci != cj:
+                has_external_in[ci] = True
+    source_ids = tuple(
+        idx for idx in range(len(components)) if not has_external_in[idx]
+    )
+    return components, source_ids
+
+
+def _matching_excluding_rows(adj, n, excluded_rows):
+    """只在不属于 excluded_rows 的行上求最大匹配，返回 (rm, cm, count)。"""
+    if not excluded_rows:
+        return _maximum_matching([list(row) for row in adj], n, n, None)
+    sub_adj = []
+    for r in range(n):
+        sub_adj.append([] if r in excluded_rows else list(adj[r]))
+    return _maximum_matching(sub_adj, n, n, None)
+
+
+def select_dedicated_inputs(entries, n_states=None):
+    """为方阵状态系统选最少专用输入位置（结构可控性选址）。
+
+    状态数硬上限为 MAX_STATES（20）。
+
+    Args:
+        entries: (i, j) 非零位置可迭代集合，表示 A[i][j] != 0，即状态
+            有向图中的边 j -> i。重复位置去重，下标规则与 analyze 相同
+            （int、拒绝 bool/NaN/Infinity、非负）。
+        n_states: 可选显式方阵阶数（0..20）。省略时由最大下标 +1 推断
+            （空集合推断为 0）；显式给定时越界位置报
+            InvalidStructureError。
+
+    Returns:
+        InputPlacement 证书。
+
+    Raises:
+        TypeError / InvalidStructureError / LimitExceededError: 与 analyze
+            相同的输入错误语义；状态数超过 20 报 LimitExceededError。
+
+    注意：本结论是*结构*（通用）可控性，只回答“非零模式允许可控”，
+    不代替对某个具体数值矩阵做 PBH 等数值可控性判断。
+    """
+    from itertools import combinations
+
+    if n_states is not None:
+        n_states = _as_dim(n_states, "n_states")
+        if n_states > MAX_STATES:
+            raise LimitExceededError(
+                f"n_states={n_states} 超过上限 {MAX_STATES}"
+            )
+    if n_states is None:
+        # 方阵：阶数取行列两个方向推断值的较大者。
+        nr, nc, _, _, _ = _normalize(entries, None, None)
+        n_states = max(nr, nc)
+    n, _, adj, _, edge_set = _normalize(entries, n_states, n_states)
+    if n > MAX_STATES:
+        raise LimitExceededError(f"n_states={n} 超过上限 {MAX_STATES}")
+
+    succ = [set() for _ in range(n)]
+    for i, j in edge_set:  # A[i][j] != 0  ->  边 j -> i
+        succ[j].add(i)
+    components, source_ids = _source_sccs_of_state_graph(n, succ)
+    components = tuple(tuple(comp) for comp in components)
+    source_sccs = tuple(
+        sorted((components[idx] for idx in source_ids), key=lambda c: c[0])
+    )
+    source_sets = [frozenset(comp) for comp in source_sccs]
+
+    _, _, rank = _maximum_matching([list(row) for row in adj], n, n, None)
+    lower = max(len(source_sccs), n - rank)
+
+    chosen = None
+    evidence = None
+    k = lower
+    while chosen is None and k <= n:
+        for cand in combinations(range(n), k):
+            cand_set = frozenset(cand)
+            # 条件 1：每个源 SCC 至少有一个被选状态（可达性）。
+            if any(cand_set.isdisjoint(scc) for scc in source_sets):
+                continue
+            # 条件 2：删去这些行后其余行全部可匹配（无膨胀）。
+            rm, cm, count = _matching_excluding_rows(adj, n, cand_set)
+            if count == n - k:
+                chosen = cand
+                evidence = (rm, cm)
+                break
+        k += 1
+
+    if chosen is None:  # 理论上不可达：取全部 n 个状态必可行。
+        raise StructuralError("内部错误：未找到可行专用输入集合")
+
+    rm, cm = evidence
+    coverage = tuple(
+        min(s for s in chosen if s in scc) for scc in source_sets
+    )
+    return InputPlacement(
+        n_states=n,
+        states=tuple(chosen),
+        structural_rank=rank,
+        row_match=tuple(rm),
+        col_match=tuple(cm),
+        unmatched_states=tuple(i for i in range(n) if rm[i] == -1),
+        source_sccs=source_sccs,
+        scc_coverage=coverage,
+    )
