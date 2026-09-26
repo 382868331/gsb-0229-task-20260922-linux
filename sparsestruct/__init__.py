@@ -1,6 +1,7 @@
-"""稀疏矩阵的结构秩与块三角化（纯组合结构分析，不做任何数值消元）。
+"""稀疏矩阵的结构秩、块三角化与最少专用输入选址（纯组合结构分析）。
 
-公开接口见 :func:`analyze` 与 :class:`StructuralDecomposition`。
+公开接口见 :func:`analyze`、:class:`StructuralDecomposition` 与
+:func:`minimum_dedicated_inputs`、:class:`InputPlacement`。
 本模块只读取非零元的*位置*，从不读取或推断数值，因此结构结论是精确的
 离散结论，不涉及浮点误差。
 """
@@ -15,20 +16,25 @@ from typing import Iterable, Optional
 __all__ = [
     "MAX_ROWS",
     "MAX_COLS",
+    "MAX_STATES",
     "StructuralError",
     "InvalidStructureError",
     "LimitExceededError",
     "SearchBudgetExhausted",
     "Block",
     "StructuralDecomposition",
+    "InputPlacement",
     "analyze",
     "verify",
+    "minimum_dedicated_inputs",
 ]
 
 #: 接口允许的最大行数（题面给定的硬边界）。
 MAX_ROWS = 100
 #: 接口允许的最大列数（题面给定的硬边界）。
 MAX_COLS = 100
+#: 结构可控性输入选址的状态数硬上限（题面给定的硬边界）。
+MAX_STATES = 20
 
 _U = "U"  # underdetermined 欠定区（列多于行）
 _W = "W"  # well-determined 良定区（方阵块）
@@ -737,3 +743,208 @@ def verify(d: StructuralDecomposition) -> bool:
                     f"良定块 {k} 不是强连通分量（不可约块划分有误）"
                 )
     return True
+
+
+# --------------------------------------------------------------------------- #
+# 结构可控性：最少专用输入选址
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class InputPlacement:
+    """最少专用输入选址结果证书（每个输入只直接作用于一个状态）。
+
+    约定：非零位置 (i, j) 视为状态有向边 j -> i（列状态 j 驱动行状态
+    i，对应 x' = Ax 的稀疏模式）。选址同时满足两条结构条件：
+
+    1. 增广结构秩条件（无膨胀）：在 A 的二部图基础上，为每个被选状态
+       s 增加一个只连接行 s 的输入列后，存在覆盖全部 n 行的匹配
+       （即 [A B] 模式满结构秩）；
+    2. 源 SCC 可达条件：状态有向图的每个源强连通分量（缩点后无入边的
+       分量）都含有至少一个被选状态，等价于所有状态都可由输入到达。
+
+    在满足两条件的集合中取大小最小者；并列时按状态 ID 升序元组取
+    字典序最小者。所有字段均为不可变的确定性结果。
+
+    Attributes:
+        n_states: 状态数 n（方阵维度）。
+        nonzeros: 去重后的非零位置集合。
+        structural_rank: A 自身的结构秩（最大匹配基数）。
+        rank_deficiency: 结构秩缺口 n - structural_rank。
+        col_match: A 自身最大匹配的列证书，col_match[c] 为列 c 匹配的
+            行，未匹配为 -1（匹配证据之一）。
+        unmatched_states: A 自身最大匹配下未匹配的状态列（升序）。
+        selected_states: 选中的输入作用状态（升序，字典序最小解）。
+        row_assign: 增广匹配证据。row_assign[r] 为行 r 匹配到的状态
+            列 j；为 -1 时表示行 r 由 r 处的专用输入直接覆盖。全部
+            n 行均被覆盖。
+        source_sccs: 源强连通分量列表（按各自最小状态 ID 排序，分量内
+            状态升序）。
+        scc_inputs: 与 source_sccs 对齐：覆盖该源 SCC 的输入状态（该
+            分量内被选中的最小状态 ID）。
+    """
+
+    n_states: int
+    nonzeros: frozenset[tuple[int, int]]
+    structural_rank: int
+    rank_deficiency: int
+    col_match: tuple[int, ...]
+    unmatched_states: tuple[int, ...]
+    selected_states: tuple[int, ...]
+    row_assign: tuple[int, ...]
+    source_sccs: tuple[tuple[int, ...], ...]
+    scc_inputs: tuple[int, ...]
+
+
+def _augmented_row_assign(adj, n, selected):
+    """增广二部图匹配：A 的状态列 + 每个被选状态一个专用输入列。
+
+    输入列 n + i 只与行 selected[i] 相邻。返回行分配列表：行 r 匹配到
+    状态列 j 时值为 j，匹配到自己的专用输入列时值为 -1；若无法覆盖
+    全部行则返回 None（存在膨胀）。
+    """
+    k = len(selected)
+    input_col_of_row = {s: n + i for i, s in enumerate(selected)}
+    cmatch = [-1] * (n + k)
+
+    def augment(r, seen):
+        for c in adj[r]:
+            if c in seen:
+                continue
+            seen.add(c)
+            if cmatch[c] == -1 or augment(cmatch[c], seen):
+                cmatch[c] = r
+                return True
+        ic = input_col_of_row.get(r)
+        if ic is not None and ic not in seen:
+            seen.add(ic)
+            if cmatch[ic] == -1 or augment(cmatch[ic], seen):
+                cmatch[ic] = r
+                return True
+        return False
+
+    for r in range(n):
+        if not augment(r, set()):
+            return None
+    assign = [None] * n
+    for c in range(n):
+        if cmatch[c] != -1:
+            assign[cmatch[c]] = c
+    for i, s in enumerate(selected):
+        if cmatch[n + i] != -1:
+            assign[s] = -1  # 该行由自己的专用输入覆盖
+    if any(v is None for v in assign):
+        return None  # 理论不可达：上面已确认每行增广成功
+    return assign
+
+
+def minimum_dedicated_inputs(entries, n_states=None) -> InputPlacement:
+    """求最少专用输入选址（每个输入只直接作用于一个状态）。
+
+    把方阵非零模式视作状态有向图：非零 (i, j) 即边 j -> i。返回同时
+    满足“增广结构秩满秩（无膨胀）”与“源 SCC 全覆盖（输入可达所有
+    状态）”的最小状态集合；并列按状态 ID 升序元组字典序最小。注意
+    这是*结构*可控性结论，不代替任何具体数值矩阵的可控性判断。
+
+    Args:
+        entries: (row, col) 非零位置的可迭代集合；重复位置自动去重，
+            结果与传入顺序无关。下标规则与 analyze() 相同。
+        n_states: 可选显式状态数（0..20）。省略时由最大下标 +1 推断，
+            且推断出的行列数必须相等（方阵），否则报
+            InvalidStructureError。
+
+    Returns:
+        InputPlacement 证书。
+
+    Raises:
+        TypeError: 类型错误（含 bool 冒充 int、浮点下标）。
+        InvalidStructureError: 非法结构（NaN/Infinity、负数、越界、
+            推断维度非方阵等）。
+        LimitExceededError: 状态数超过 20 的接口边界。
+    """
+    if n_states is not None:
+        n_states = _as_dim(n_states, "n_states")
+        if n_states > MAX_STATES:
+            raise LimitExceededError(
+                f"n_states={n_states} 超过上限 {MAX_STATES}"
+            )
+        n_rows, n_cols, adj, radj, edge_set = _normalize(
+            entries, n_states, n_states
+        )
+    else:
+        n_rows, n_cols, adj, radj, edge_set = _normalize(entries, None, None)
+        if n_rows != n_cols:
+            raise InvalidStructureError(
+                f"输入选址需要方阵非零模式，推断得到 {n_rows}x{n_cols}"
+            )
+        n_states = n_rows
+        if n_states > MAX_STATES:
+            raise LimitExceededError(
+                f"推断状态数 {n_states} 超过上限 {MAX_STATES}"
+            )
+    n = n_states
+
+    rmatch, cmatch, rank = _maximum_matching(adj, n, n, None)
+    unmatched = tuple(c for c in range(n) if cmatch[c] == -1)
+
+    # 状态有向图：非零 (r, c) 即边 c -> r，故正向邻接表就是 radj。
+    graph_adj = {v: radj[v] for v in range(n)}
+    sccs = _kosaraju(list(range(n)), graph_adj)
+    comp_of = [0] * n
+    for idx, comp in enumerate(sccs):
+        for v in comp:
+            comp_of[v] = idx
+    has_incoming = [False] * len(sccs)
+    for v in range(n):
+        for w in graph_adj[v]:
+            if comp_of[v] != comp_of[w]:
+                has_incoming[comp_of[w]] = True
+    source_sccs = sorted(
+        (tuple(comp) for comp, incoming in zip(sccs, has_incoming)
+         if not incoming),
+        key=lambda comp: comp[0],
+    )
+
+    # 下界：输入数至少为 max(源 SCC 数, 结构秩缺口)。从下界起按规模
+    # 枚举子集（组合本身按字典序产生），第一个同时满足两条件者即
+    # 最小且状态 ID 字典序最小的解。
+    from itertools import combinations
+
+    lower = max(len(source_sccs), n - rank)
+    selected = None
+    assign = None
+    for size in range(lower, n + 1):
+        for combo in combinations(range(n), size):
+            picked = frozenset(combo)
+            if any(
+                not any(v in picked for v in comp) for comp in source_sccs
+            ):
+                continue
+            trial = _augmented_row_assign(adj, n, combo)
+            if trial is not None:
+                selected = combo
+                assign = trial
+                break
+        if selected is not None:
+            break
+    if selected is None:
+        # 理论不可达：取全部 n 个状态时两条件必然同时成立。
+        raise StructuralError("内部错误：未找到可行的输入选址")
+
+    picked = set(selected)
+    scc_inputs = tuple(
+        min(v for v in comp if v in picked) for comp in source_sccs
+    )
+
+    return InputPlacement(
+        n_states=n,
+        nonzeros=edge_set,
+        structural_rank=rank,
+        rank_deficiency=n - rank,
+        col_match=tuple(cmatch),
+        unmatched_states=unmatched,
+        selected_states=tuple(selected),
+        row_assign=tuple(assign),
+        source_sccs=tuple(source_sccs),
+        scc_inputs=scc_inputs,
+    )
